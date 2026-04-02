@@ -64,7 +64,8 @@ section = st.sidebar.radio(
      "🌍 Exposure",
      "📋 Holdings Analysis",
      "🔗 Combined Analysis",
-     "⏱ Time-Series"],
+     "⏱ Time-Series",
+     "🔍 Ticker Deep Dive"],
 )
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -664,3 +665,147 @@ elif section == "⏱ Time-Series":
                  labels={"delta_min":"Δ Holdings (lower bound)","etf_count":"ETF Count"})
     fig.add_vline(x=0, line_dash="dash", line_color="red")
     st.plotly_chart(fig, use_container_width=True)
+
+# ══════════════════════════════════════════════════════════════════════════
+elif section == "🔍 Ticker Deep Dive":
+    st.header("Ticker Deep Dive")
+
+    # Build sorted list of tickers that have holdings on BEST_DATE
+    ticker_list = sorted(
+        ind["composite_ticker"].dropna().unique().tolist()
+    )
+    default_idx = ticker_list.index("SPY") if "SPY" in ticker_list else 0
+    ticker = st.selectbox("Select ETF ticker", ticker_list, index=default_idx)
+
+    # ── Fund metadata from INDUSTRY ───────────────────────────────────────
+    meta = ind[ind["composite_ticker"] == ticker]
+    if meta.empty:
+        st.warning(f"No INDUSTRY record found for {ticker}.")
+        st.stop()
+    meta = meta.iloc[0]
+
+    st.subheader(f"{ticker} — {meta.get('description', '') or ''}")
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Issuer", meta.get("issuer") or "—")
+    c2.metric("Asset Class", meta.get("asset_class") or "—")
+    c3.metric("AUM", f"${meta['aum_bn']:.2f}B" if pd.notna(meta.get("aum_bn")) else "—")
+    c4.metric("Expense Ratio",
+              f"{meta['net_expenses_bps']:.0f} bps"
+              if pd.notna(meta.get("net_expenses_bps")) else "—")
+    c5.metric("# Holdings (reported)",
+              f"{int(meta['num_holdings']):,}"
+              if pd.notna(meta.get("num_holdings")) else "—")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**Fund details**")
+        details = {
+            "Category": meta.get("category"),
+            "Region": meta.get("region"),
+            "Sector Exposure": meta.get("sector_exposure"),
+            "Development Class": meta.get("development_class"),
+            "Benchmark": meta.get("primary_benchmark"),
+            "Listing Exchange": meta.get("listing_exchange"),
+            "Inception Date": meta.get("inception_date"),
+            "Distribution Freq.": meta.get("distribution_frequency"),
+            "Leveraged": meta.get("is_levered"),
+            "ETN": meta.get("is_etn"),
+        }
+        st.table(
+            pd.DataFrame({"Value": {k: ("—" if v is None or (isinstance(v, float) and pd.isna(v)) else v)
+                                    for k, v in details.items()}})
+        )
+    with col2:
+        st.markdown("**Liquidity & trading**")
+        trading = {
+            "Bid-Ask Spread": f"{meta['bid_ask_spread']:.4f}" if pd.notna(meta.get("bid_ask_spread")) else "—",
+            "Discount/Premium": f"{meta['discount_premium']:.4f}" if pd.notna(meta.get("discount_premium")) else "—",
+            "Short Interest": f"{int(meta['short_interest']):,}" if pd.notna(meta.get("short_interest")) else "—",
+        }
+        st.table(pd.DataFrame({"Value": trading}))
+
+    st.divider()
+
+    # ── Holdings from CONSTITUENTS ────────────────────────────────────────
+    with st.spinner(f"Loading holdings for {ticker}…"):
+        holdings = q(f"""
+            SELECT constituent_ticker, constituent_name, asset_class,
+                   security_type, country_of_exchange, currency_traded,
+                   ROUND(weight, 4) AS weight,
+                   market_value, shares_held
+            FROM ETF_DB.LOCAL_COPY.CONSTITUENTS
+            WHERE composite_ticker = '{ticker}'
+              AND as_of_date = '{BEST_DATE}'
+            ORDER BY weight DESC
+        """)
+
+    if holdings.empty:
+        st.info(f"No constituent data for {ticker} on {BEST_DATE}.")
+    else:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Actual Holdings", f"{len(holdings):,}")
+        c2.metric("Total Weight", f"{holdings['weight'].sum():.2f}%")
+        c3.metric("Top-10 Weight", f"{holdings.head(10)['weight'].sum():.2f}%")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Top 25 Holdings")
+            top25 = holdings.head(25)[
+                ["constituent_ticker", "constituent_name", "weight", "market_value"]
+            ].copy()
+            top25["constituent_name"] = top25["constituent_name"].str[:35]
+            top25 = top25.rename(columns={
+                "constituent_ticker": "Ticker",
+                "constituent_name": "Name",
+                "weight": "Weight (%)",
+                "market_value": "Market Value ($)",
+            })
+            top25["Market Value ($)"] = top25["Market Value ($)"].apply(
+                lambda v: f"${v:,.0f}" if pd.notna(v) else "—"
+            )
+            st.dataframe(top25, use_container_width=True, hide_index=True)
+
+        with col2:
+            fig = px.bar(
+                holdings.head(25),
+                x="weight", y="constituent_ticker",
+                orientation="h",
+                hover_data=["constituent_name"],
+                title="Top 25 Holdings by Weight (%)",
+                labels={"weight": "Weight (%)", "constituent_ticker": ""},
+            )
+            fig.update_layout(yaxis={"categoryorder": "total ascending"})
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("Portfolio Breakdown")
+        col1, col2 = st.columns(2)
+        with col1:
+            ac_w = (
+                holdings.groupby("asset_class")["weight"].sum()
+                .sort_values(ascending=False).reset_index()
+            )
+            fig = px.pie(ac_w, values="weight", names="asset_class",
+                         title="Weight by Asset Class")
+            fig.update_traces(textposition="inside", textinfo="percent+label")
+            st.plotly_chart(fig, use_container_width=True)
+        with col2:
+            country_w = (
+                holdings.groupby("country_of_exchange")["weight"].sum()
+                .sort_values(ascending=False).head(10).reset_index()
+            )
+            fig = px.bar(country_w, x="weight", y="country_of_exchange",
+                         orientation="h",
+                         title="Top 10 Countries by Weight (%)",
+                         labels={"weight": "Weight (%)", "country_of_exchange": ""})
+            fig.update_layout(yaxis={"categoryorder": "total ascending"})
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("Weight Distribution")
+        fig = px.histogram(
+            holdings[holdings["weight"] > 0],
+            x="weight", nbins=50,
+            title="Constituent Weight Distribution (%)",
+            labels={"weight": "Weight (%)"},
+        )
+        st.plotly_chart(fig, use_container_width=True)
