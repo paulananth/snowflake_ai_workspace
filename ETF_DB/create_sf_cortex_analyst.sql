@@ -2,14 +2,17 @@
 USE ROLE ACCOUNTADMIN;
 ALTER ACCOUNT SET ENABLE_CORTEX_ANALYST = TRUE;
 
-GRANT USAGE ON DATABASE ETF_DB TO ROLE cortex_user_role;
-GRANT USAGE ON SCHEMA ETF_DB.LOCAL_COPY TO ROLE cortex_user_role;
+-- Grants to cortex_user_role omitted (role not needed for this workspace)
 
--- List all semantic models
-SHOW SEMANTIC VIEWS IN SCHEMA ETF_DB.LOCAL_COPY;
+-- The semantic model is defined in analyst2_semantic_model.yaml, uploaded to:
+--   @ETF_DB.LOCAL_COPY.cortex_stage/analyst2_semantic_model.yaml
+-- Cortex Analyst reads it directly via the REST API (no CREATE SEMANTIC VIEW needed).
 
--- Describe the semantic model
-DESC SEMANTIC VIEW ETF_DB.LOCAL_COPY.ANALYST2;
+-- Verify the YAML is in place:
+LIST @ETF_DB.LOCAL_COPY.cortex_stage;
+
+-- Describe the semantic model (run only after ANALYST2 has been created)
+-- DESC SEMANTIC VIEW ETF_DB.LOCAL_COPY.ANALYST2;
 
 -- Check your Snowflake version and region
 SELECT CURRENT_VERSION(), CURRENT_REGION();

@@ -1,6 +1,6 @@
-create database etf_db;
+CREATE DATABASE IF NOT EXISTS etf_db;
 
-create schema etf_db.local_copy;
+CREATE SCHEMA IF NOT EXISTS etf_db.local_copy;
 
 
 CREATE OR REPLACE TABLE etf_db.local_copy.CONSTITUENTS AS

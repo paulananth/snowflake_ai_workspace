@@ -1,0 +1,535 @@
+name: ETF Analysis
+description: >
+  Semantic model for ETF constituent holdings and ETF industry/fund metadata.
+  CONSTITUENTS contains individual stock/bond holdings per ETF. INDUSTRY
+  contains fund-level attributes such as AUM, category, sector exposure,
+  and fees. The two tables join on COMPOSITE_TICKER (the ETF's own ticker).
+
+tables:
+  - name: CONSTITUENTS
+    description: >
+      Each row represents one holding of an ETF on a specific date.
+      COMPOSITE_TICKER identifies the ETF; CONSTITUENT_TICKER identifies the
+      held security. WEIGHT is the fraction of the portfolio allocated to
+      that security.
+    base_table:
+      database: ETF_DB
+      schema: LOCAL_COPY
+      table: CONSTITUENTS
+    primary_key:
+      columns:
+        - as_of_date
+        - etf_ticker
+        - constituent_ticker
+
+    time_dimensions:
+      - name: as_of_date
+        synonyms:
+          - "data date"
+          - "reporting date"
+          - "holding date"
+          - "as of"
+        description: Date on which the constituent holdings snapshot was taken.
+        expr: AS_OF_DATE
+        data_type: date
+        unique: false
+
+    dimensions:
+      - name: etf_ticker
+        synonyms:
+          - "ETF ticker"
+          - "fund ticker"
+          - "composite ticker"
+          - "ETF symbol"
+        description: Ticker symbol of the ETF (composite / parent fund).
+        expr: COMPOSITE_TICKER
+        data_type: TEXT
+        sample_values:
+          - "SPY"
+          - "QQQ"
+          - "IVV"
+          - "VTI"
+          - "AGG"
+
+      - name: constituent_ticker
+        synonyms:
+          - "holding ticker"
+          - "stock ticker"
+          - "security ticker"
+          - "position ticker"
+        description: Ticker symbol of the individual security held by the ETF.
+        expr: CONSTITUENT_TICKER
+        data_type: TEXT
+        sample_values:
+          - "AAPL"
+          - "MSFT"
+          - "AMZN"
+
+      - name: constituent_name
+        synonyms:
+          - "holding name"
+          - "security name"
+          - "company name"
+          - "stock name"
+        description: Full name of the security held by the ETF.
+        expr: CONSTITUENT_NAME
+        data_type: TEXT
+
+      - name: asset_class
+        synonyms:
+          - "holding asset class"
+          - "security class"
+          - "asset type"
+        description: Asset class of the individual holding (e.g., Equity, Fixed Income).
+        expr: ASSET_CLASS
+        data_type: TEXT
+        sample_values:
+          - "Equity"
+          - "Fixed Income"
+          - "Cash"
+
+      - name: security_type
+        synonyms:
+          - "security classification"
+          - "instrument type"
+        description: Type of security (e.g., Common Stock, Bond, ETF).
+        expr: SECURITY_TYPE
+        data_type: TEXT
+
+      - name: country_of_exchange
+        synonyms:
+          - "country"
+          - "listing country"
+          - "exchange country"
+        description: Country where the constituent security is listed/exchanged.
+        expr: COUNTRY_OF_EXCHANGE
+        data_type: TEXT
+        sample_values:
+          - "US"
+          - "GB"
+          - "JP"
+
+      - name: exchange
+        synonyms:
+          - "stock exchange"
+          - "trading venue"
+        description: Exchange on which the constituent is traded.
+        expr: EXCHANGE
+        data_type: TEXT
+        sample_values:
+          - "NASDAQ"
+          - "NYSE"
+          - "LSE"
+
+      - name: currency_traded
+        synonyms:
+          - "currency"
+          - "trading currency"
+        description: Currency in which the constituent security is traded.
+        expr: CURRENCY_TRADED
+        data_type: TEXT
+        sample_values:
+          - "USD"
+          - "EUR"
+          - "GBP"
+
+      - name: cusip
+        synonyms:
+          - "CUSIP code"
+          - "security identifier"
+        description: CUSIP identifier of the security.
+        expr: CUSIP
+        data_type: TEXT
+
+      - name: isin
+        synonyms:
+          - "ISIN code"
+          - "international security identifier"
+        description: ISIN identifier of the security.
+        expr: ISIN
+        data_type: TEXT
+
+    facts:
+      - name: weight
+        synonyms:
+          - "holding weight"
+          - "portfolio weight"
+          - "allocation"
+          - "position weight"
+          - "percentage weight"
+        description: >
+          Weight of the constituent in the ETF portfolio as a decimal
+          (e.g., 0.07 = 7%). Used to measure portfolio concentration.
+        expr: WEIGHT
+        data_type: NUMBER
+        default_aggregation: sum
+
+      - name: market_value
+        synonyms:
+          - "market value"
+          - "position value"
+          - "holding value"
+          - "dollar value"
+        description: Market value of the holding in the ETF (in USD).
+        expr: MARKET_VALUE
+        data_type: NUMBER
+        default_aggregation: sum
+
+      - name: shares_held
+        synonyms:
+          - "shares"
+          - "number of shares"
+          - "share count"
+        description: Number of shares of the constituent held by the ETF.
+        expr: SHARES_HELD
+        data_type: NUMBER
+        default_aggregation: sum
+
+  - name: INDUSTRY
+    description: >
+      Each row represents one ETF on a specific date, containing fund-level
+      metadata such as AUM, expense ratios, category, region focus, and
+      sector/industry exposure classifications.
+    base_table:
+      database: ETF_DB
+      schema: LOCAL_COPY
+      table: INDUSTRY
+    primary_key:
+      columns:
+        - as_of_date
+        - etf_ticker
+
+    time_dimensions:
+      - name: as_of_date
+        synonyms:
+          - "data date"
+          - "reporting date"
+          - "as of"
+        description: Date of the ETF data snapshot.
+        expr: AS_OF_DATE
+        data_type: date
+        unique: false
+
+      - name: inception_date
+        synonyms:
+          - "fund inception"
+          - "launch date"
+          - "start date"
+        description: Date the ETF was launched.
+        expr: INCEPTION_DATE
+        data_type: date
+        unique: false
+
+    dimensions:
+      - name: etf_ticker
+        synonyms:
+          - "ETF ticker"
+          - "fund ticker"
+          - "composite ticker"
+          - "ETF symbol"
+        description: Ticker symbol of the ETF.
+        expr: COMPOSITE_TICKER
+        data_type: TEXT
+        sample_values:
+          - "SPY"
+          - "QQQ"
+          - "IVV"
+          - "VTI"
+          - "AGG"
+
+      - name: etf_name
+        synonyms:
+          - "fund name"
+          - "ETF description"
+          - "fund description"
+          - "ETF full name"
+        description: Full name / description of the ETF.
+        expr: DESCRIPTION
+        data_type: TEXT
+
+      - name: issuer
+        synonyms:
+          - "ETF issuer"
+          - "fund company"
+          - "fund family"
+          - "provider"
+          - "sponsor"
+        description: Company that issues / sponsors the ETF.
+        expr: ISSUER
+        data_type: TEXT
+        sample_values:
+          - "BlackRock"
+          - "Vanguard"
+          - "State Street"
+          - "Invesco"
+
+      - name: asset_class
+        synonyms:
+          - "fund asset class"
+          - "ETF asset class"
+          - "investment type"
+        description: Broad asset class of the ETF (Equity, Fixed Income, etc.).
+        expr: ASSET_CLASS
+        data_type: TEXT
+        sample_values:
+          - "Equity"
+          - "Fixed Income"
+          - "Alternatives"
+          - "Multi-Asset"
+
+      - name: category
+        synonyms:
+          - "ETF category"
+          - "fund category"
+          - "morningstar category"
+        description: Category or style classification of the ETF.
+        expr: CATEGORY
+        data_type: TEXT
+        sample_values:
+          - "Large Blend"
+          - "Technology"
+          - "Intermediate-Term Bond"
+
+      - name: focus
+        synonyms:
+          - "ETF focus"
+          - "fund focus"
+          - "investment focus"
+        description: Specific investment focus or theme of the ETF.
+        expr: FOCUS
+        data_type: TEXT
+
+      - name: development_class
+        synonyms:
+          - "market classification"
+          - "developed emerging"
+          - "market type"
+        description: >
+          Market development classification of the ETF's target market
+          (Developed, Emerging, Frontier, etc.).
+        expr: DEVELOPMENT_CLASS
+        data_type: TEXT
+        sample_values:
+          - "Developed"
+          - "Emerging"
+          - "Frontier"
+          - "Blend"
+
+      - name: region
+        synonyms:
+          - "geographic region"
+          - "investment region"
+          - "target region"
+        description: Geographic region the ETF targets.
+        expr: REGION
+        data_type: TEXT
+        sample_values:
+          - "North America"
+          - "Europe"
+          - "Asia Pacific"
+          - "Global"
+
+      - name: geographic_exposure
+        synonyms:
+          - "country exposure"
+          - "geographic focus"
+        description: Primary geographic exposure classification of the ETF.
+        expr: GEOGRAPHIC_EXPOSURE
+        data_type: TEXT
+
+      - name: sector_exposure
+        synonyms:
+          - "sector"
+          - "sector focus"
+          - "industry sector"
+        description: Primary sector exposure of the ETF (e.g., Technology, Healthcare).
+        expr: SECTOR_EXPOSURE
+        data_type: TEXT
+        sample_values:
+          - "Technology"
+          - "Healthcare"
+          - "Financials"
+          - "Energy"
+
+      - name: industry_exposure
+        synonyms:
+          - "industry"
+          - "industry focus"
+        description: Primary industry exposure of the ETF.
+        expr: INDUSTRY_EXPOSURE
+        data_type: TEXT
+
+      - name: industry_group_exposure
+        synonyms:
+          - "industry group"
+          - "GICS industry group"
+        description: Industry group exposure classification.
+        expr: INDUSTRY_GROUP_EXPOSURE
+        data_type: TEXT
+
+      - name: currency_exposure
+        synonyms:
+          - "currency"
+          - "forex exposure"
+        description: Primary currency exposure of the ETF.
+        expr: CURRENCY_EXPOSURE
+        data_type: TEXT
+
+      - name: listing_exchange
+        synonyms:
+          - "exchange"
+          - "listed on"
+          - "trading exchange"
+        description: Exchange on which the ETF itself is listed.
+        expr: LISTING_EXCHANGE
+        data_type: TEXT
+        sample_values:
+          - "NYSE Arca"
+          - "NASDAQ"
+          - "BATS"
+
+      - name: tax_classification
+        synonyms:
+          - "tax type"
+          - "tax treatment"
+        description: Tax classification of the ETF (e.g., RIC, Grantor Trust).
+        expr: TAX_CLASSIFICATION
+        data_type: TEXT
+
+      - name: is_leveraged
+        synonyms:
+          - "leveraged"
+          - "uses leverage"
+        description: Whether the ETF uses leverage.
+        expr: IS_LEVERAGED
+        data_type: BOOLEAN
+
+      - name: is_active
+        synonyms:
+          - "active"
+          - "currently trading"
+          - "live fund"
+        description: Whether the ETF is currently active / trading.
+        expr: IS_ACTIVE
+        data_type: BOOLEAN
+
+      - name: is_etn
+        synonyms:
+          - "ETN"
+          - "exchange traded note"
+        description: Whether the product is an ETN (exchange-traded note) rather than an ETF.
+        expr: IS_ETN
+        data_type: BOOLEAN
+
+      - name: distribution_frequency
+        synonyms:
+          - "dividend frequency"
+          - "payout frequency"
+        description: How often the ETF distributes dividends (Monthly, Quarterly, etc.).
+        expr: DISTRIBUTION_FREQUENCY
+        data_type: TEXT
+
+      - name: primary_benchmark
+        synonyms:
+          - "benchmark"
+          - "index"
+          - "tracks index"
+        description: The primary benchmark index the ETF tracks.
+        expr: PRIMARY_BENCHMARK
+        data_type: TEXT
+
+    facts:
+      - name: aum
+        synonyms:
+          - "assets under management"
+          - "fund size"
+          - "total assets"
+          - "AUM"
+        description: Assets under management of the ETF in USD.
+        expr: AUM
+        data_type: NUMBER
+        default_aggregation: sum
+
+      - name: num_holdings
+        synonyms:
+          - "number of holdings"
+          - "number of constituents"
+          - "portfolio size"
+          - "holding count"
+        description: Number of individual securities held by the ETF.
+        expr: NUM_HOLDINGS
+        data_type: NUMBER
+        default_aggregation: avg
+
+      - name: management_fee
+        synonyms:
+          - "management fee"
+          - "advisory fee"
+        description: Annual management fee charged by the ETF (as a percentage).
+        expr: MANAGEMENT_FEE
+        data_type: NUMBER
+        default_aggregation: avg
+
+      - name: net_expenses
+        synonyms:
+          - "expense ratio"
+          - "net expense ratio"
+          - "annual cost"
+          - "total cost"
+          - "fee"
+        description: Net annual expense ratio of the ETF (management fee minus waivers).
+        expr: NET_EXPENSES
+        data_type: NUMBER
+        default_aggregation: avg
+
+      - name: total_expenses
+        synonyms:
+          - "gross expense ratio"
+          - "total expense ratio"
+          - "gross expenses"
+        description: Gross total annual expense ratio before any fee waivers.
+        expr: TOTAL_EXPENSES
+        data_type: NUMBER
+        default_aggregation: avg
+
+      - name: bid_ask_spread
+        synonyms:
+          - "spread"
+          - "bid ask spread"
+          - "liquidity spread"
+        description: Bid-ask spread of the ETF as a measure of trading liquidity.
+        expr: BID_ASK_SPREAD
+        data_type: NUMBER
+        default_aggregation: avg
+
+      - name: short_interest
+        synonyms:
+          - "short interest"
+          - "shares sold short"
+        description: Total short interest in the ETF.
+        expr: SHORT_INTEREST
+        data_type: NUMBER
+        default_aggregation: sum
+
+      - name: discount_premium
+        synonyms:
+          - "premium discount"
+          - "NAV premium"
+          - "NAV discount"
+          - "price vs NAV"
+        description: >
+          Discount or premium of the ETF price relative to its NAV.
+          Positive = premium; negative = discount.
+        expr: DISCOUNT_PREMIUM
+        data_type: NUMBER
+        default_aggregation: avg
+
+relationships:
+  - name: constituents_to_industry
+    left_table: CONSTITUENTS
+    right_table: INDUSTRY
+    relationship_columns:
+      - left_column: etf_ticker
+        right_column: etf_ticker
+    relationship_type: many_to_one
+    join_type: left_outer
