@@ -263,7 +263,7 @@ elif section == "🌍 Exposure":
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        lev = ind["is_leveraged"].value_counts().reset_index()
+        lev = ind["is_levered"].value_counts().reset_index()
         lev.columns = ["lev","count"]
         lev["label"] = lev["lev"].map({True:"Leveraged", False:"Non-Leveraged"})
         fig = px.pie(lev, values="count", names="label", title="Leveraged ETFs",
