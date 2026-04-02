@@ -65,7 +65,8 @@ section = st.sidebar.radio(
      "📋 Holdings Analysis",
      "🔗 Combined Analysis",
      "⏱ Time-Series",
-     "🔍 Ticker Deep Dive"],
+     "🔍 Ticker Deep Dive",
+     "📌 Security Lookup"],
 )
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -809,3 +810,147 @@ elif section == "🔍 Ticker Deep Dive":
             labels={"weight": "Weight (%)"},
         )
         st.plotly_chart(fig, use_container_width=True)
+
+# ══════════════════════════════════════════════════════════════════════════
+elif section == "📌 Security Lookup":
+    st.header("Security (Constituent Ticker) Lookup")
+    st.caption(f"Which ETFs hold a given security — snapshot {BEST_DATE}")
+
+    # ── Ticker search ─────────────────────────────────────────────────────
+    raw = st.text_input("Enter constituent ticker (e.g. AAPL, MSFT, NVDA)", value="AAPL")
+    cticker = raw.strip().upper()
+
+    if not cticker:
+        st.info("Enter a ticker above to begin.")
+        st.stop()
+
+    with st.spinner(f"Querying holdings for {cticker}…"):
+        etf_rows = q(f"""
+            SELECT
+                c.composite_ticker  AS etf_ticker,
+                i.description       AS etf_name,
+                i.issuer,
+                i.asset_class,
+                i.category,
+                i.aum / 1e9         AS aum_bn,
+                i.net_expenses * 100 AS net_expenses_bps,
+                c.constituent_name,
+                c.asset_class       AS security_asset_class,
+                c.security_type,
+                c.country_of_exchange,
+                c.currency_traded,
+                ROUND(c.weight, 4)  AS weight,
+                c.market_value,
+                c.shares_held
+            FROM ETF_DB.LOCAL_COPY.CONSTITUENTS c
+            LEFT JOIN ETF_DB.LOCAL_COPY.INDUSTRY i
+                ON c.composite_ticker = i.composite_ticker
+            WHERE c.constituent_ticker = '{cticker}'
+              AND c.as_of_date = '{BEST_DATE}'
+            ORDER BY c.weight DESC
+        """)
+
+    if etf_rows.empty:
+        st.warning(f"**{cticker}** not found in any ETF on {BEST_DATE}. Check the ticker and try again.")
+        st.stop()
+
+    # ── Security summary ──────────────────────────────────────────────────
+    sec_name = etf_rows["constituent_name"].iloc[0] or cticker
+    st.subheader(f"{cticker} — {sec_name}")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("ETFs holding it", f"{len(etf_rows):,}")
+    c2.metric("Avg Weight across ETFs", f"{etf_rows['weight'].mean():.4f}%")
+    c3.metric("Max Weight in any ETF", f"{etf_rows['weight'].max():.4f}%")
+    c4.metric("Total AUM exposed", f"${etf_rows['aum_bn'].sum():,.1f}B")
+
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        st.markdown("**Security details**")
+        st.table(pd.DataFrame({"Value": {
+            "Security Type":      etf_rows["security_type"].iloc[0] or "—",
+            "Asset Class":        etf_rows["security_asset_class"].iloc[0] or "—",
+            "Country of Exchange":etf_rows["country_of_exchange"].iloc[0] or "—",
+            "Currency Traded":    etf_rows["currency_traded"].iloc[0] or "—",
+        }}))
+    with col2:
+        asset_counts = etf_rows["asset_class"].fillna("Unknown").value_counts().reset_index()
+        asset_counts.columns = ["asset_class", "count"]
+        fig = px.pie(asset_counts, values="count", names="asset_class",
+                     title="ETFs by Asset Class")
+        fig.update_traces(textposition="inside", textinfo="percent+label")
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # ── ETFs holding this security ────────────────────────────────────────
+    st.subheader(f"ETFs holding {cticker} (sorted by weight)")
+    display = etf_rows[
+        ["etf_ticker", "etf_name", "issuer", "asset_class", "category",
+         "aum_bn", "net_expenses_bps", "weight", "market_value", "shares_held"]
+    ].copy()
+    display["etf_name"] = display["etf_name"].str[:45]
+    display["market_value"] = display["market_value"].apply(
+        lambda v: f"${v:,.0f}" if pd.notna(v) else "—"
+    )
+    display["shares_held"] = display["shares_held"].apply(
+        lambda v: f"{v:,.0f}" if pd.notna(v) else "—"
+    )
+    display = display.rename(columns={
+        "etf_ticker": "ETF", "etf_name": "Name", "issuer": "Issuer",
+        "asset_class": "Asset Class", "category": "Category",
+        "aum_bn": "AUM ($B)", "net_expenses_bps": "Exp. Ratio (bps)",
+        "weight": "Weight (%)", "market_value": "Mkt Value ($)",
+        "shares_held": "Shares Held",
+    })
+    st.dataframe(display, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        top_n = min(30, len(etf_rows))
+        fig = px.bar(
+            etf_rows.head(top_n),
+            x="weight", y="etf_ticker", orientation="h",
+            color="asset_class",
+            hover_data=["etf_name", "aum_bn"],
+            title=f"Top {top_n} ETF Weights for {cticker} (%)",
+            labels={"weight": "Weight (%)", "etf_ticker": "ETF",
+                    "asset_class": "Asset Class"},
+        )
+        fig.update_layout(yaxis={"categoryorder": "total ascending"})
+        st.plotly_chart(fig, use_container_width=True)
+    with col2:
+        fig = px.histogram(
+            etf_rows, x="weight", nbins=40,
+            title=f"Weight Distribution of {cticker} Across ETFs",
+            labels={"weight": "Weight (%)"},
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # AUM-weighted exposure by issuer
+    issuer_exp = (
+        etf_rows[etf_rows["aum_bn"].notna()]
+        .groupby("issuer")
+        .agg(etf_count=("etf_ticker", "count"), total_aum_bn=("aum_bn", "sum"))
+        .sort_values("total_aum_bn", ascending=False)
+        .head(12).reset_index()
+    )
+    if not issuer_exp.empty:
+        st.subheader(f"Issuer Exposure — ETFs holding {cticker}")
+        col1, col2 = st.columns(2)
+        with col1:
+            fig = px.bar(issuer_exp, x="total_aum_bn", y="issuer", orientation="h",
+                         color="total_aum_bn", color_continuous_scale="Blues",
+                         title="Total AUM of ETFs holding security (by issuer)",
+                         labels={"total_aum_bn": "AUM ($B)", "issuer": ""})
+            fig.update_layout(yaxis={"categoryorder": "total ascending"}, showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+        with col2:
+            fig = px.bar(issuer_exp, x="etf_count", y="issuer", orientation="h",
+                         color="etf_count", color_continuous_scale="Oranges",
+                         title="Number of ETFs holding security (by issuer)",
+                         labels={"etf_count": "ETF Count", "issuer": ""})
+            fig.update_layout(yaxis={"categoryorder": "total ascending"}, showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
