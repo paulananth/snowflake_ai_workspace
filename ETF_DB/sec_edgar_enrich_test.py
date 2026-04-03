@@ -167,9 +167,32 @@ def determine_active_flag(
     return True, "active"
 
 
+def _class_index_from_ticker(ticker: str) -> int | None:
+    """
+    Extract a share-class index (0-based) from the ticker suffix.
+
+    Rules:
+      - Split on the last space, dot, or hyphen: "BRK B" -> "B", "BF.B" -> "B", "MOG.A" -> "A"
+      - Letter A/1 -> index 0, B/2 -> index 1, C/3 -> index 2, D/4 -> index 3
+      - Rows are sorted ascending by val before indexing, so:
+          index 0 = fewest shares (typically high-vote / A class)
+          index 1 = next tier (B class)  etc.
+      - If ticker has no recognisable class suffix -> return None (caller sets NULL).
+    """
+    # Extract suffix after the last separator
+    suffix = re.split(r"[ .\-]", ticker)[-1].upper()
+    if suffix == ticker.upper():
+        # No separator found — no class info extractable
+        return None
+    letter_map = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4,
+                  "1": 0, "2": 1, "3": 2, "4": 3}
+    return letter_map.get(suffix)  # None if suffix not in map
+
+
 def fetch_shares_outstanding(
     cik: str,
     session: requests.Session,
+    ticker: str = "",
 ) -> tuple[int | None, str | None, str | None]:
     """
     Returns (shares: int|None, as_of_date: str|None, source_desc: str|None).
@@ -199,21 +222,28 @@ def fetch_shares_outstanding(
         latest_filed = filtered[0]["filed"]
         latest_form  = filtered[0]["form"]
 
-        # Sum all rows with same filed+form (handles multi-class share structures)
-        same_filing  = [
+        # Collect all rows with same filed+form date
+        same_filing = [
             p for p in filtered
             if p["filed"] == latest_filed and p["form"] == latest_form
         ]
-        total_shares = sum(p["val"] for p in same_filing)
-        as_of_date   = same_filing[0].get("end")
-        num_classes  = len(same_filing)
-        concept_tag  = "dei" if "dei" in url_template else "us-gaap"
-        source_desc  = (
-            f"{latest_form} filed {latest_filed}"
-            + (f" ({num_classes} classes summed)" if num_classes > 1 else "")
-            + f" [{concept_tag}]"
-        )
-        return total_shares, as_of_date, source_desc
+        concept_tag = "dei" if "dei" in url_template else "us-gaap"
+
+        if len(same_filing) == 1:
+            return same_filing[0]["val"], same_filing[0].get("end"), f"{latest_form} filed {latest_filed} [{concept_tag}]"
+
+        # Multiple share classes in one filing — try to match by ticker class suffix.
+        # Sort ascending by val so index 0=smallest class (usually Class A / high-vote),
+        # index 1=next (Class B), index 2=Class C, etc.
+        same_filing.sort(key=lambda p: p["val"])
+        class_idx = _class_index_from_ticker(ticker)
+        if class_idx is not None and class_idx < len(same_filing):
+            row = same_filing[class_idx]
+            return row["val"], row.get("end"), f"{latest_form} filed {latest_filed} [class_idx={class_idx}] [{concept_tag}]"
+
+        # Can't map ticker to a specific class row — return None
+        class_counts = len(same_filing)
+        return None, None, f"multi_class_unresolvable ({class_counts} classes, no suffix) [{concept_tag}]"
 
     return None, None, None
 
@@ -290,10 +320,10 @@ def main() -> None:
         # Shares outstanding
         shares, as_of, source = None, None, None
         if cik and active:
-            shares, as_of, source = fetch_shares_outstanding(cik, session)
+            shares, as_of, source = fetch_shares_outstanding(cik, session, ticker)
         elif cik and not active:
             # Still try — delisted companies have historical data
-            shares, as_of, source = fetch_shares_outstanding(cik, session)
+            shares, as_of, source = fetch_shares_outstanding(cik, session, ticker)
 
         if shares is not None:
             print(f"  SHARES    : {shares:,}  as of {as_of}  [{source}]")
