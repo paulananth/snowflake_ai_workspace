@@ -55,6 +55,10 @@ _best = q("""
 BEST_DATE = str(_best["as_of_date"].iloc[0])[:10]
 st.sidebar.caption(f"CONSTITUENTS snapshot: **{BEST_DATE}**")
 
+# ── Preload SECURITIES master ──────────────────────────────────────────────
+with st.spinner("Loading SECURITIES…"):
+    sec = q("SELECT * FROM ETF_DB.LOCAL_COPY.SECURITIES")
+
 # ── Sidebar nav ────────────────────────────────────────────────────────────
 section = st.sidebar.radio(
     "Section",
@@ -816,30 +820,30 @@ elif section == "📌 Security Lookup":
     st.header("Security (Constituent Ticker) Lookup")
     st.caption(f"Which ETFs hold a given security — snapshot {BEST_DATE}")
 
-    # ── Ticker search ─────────────────────────────────────────────────────
-    raw = st.text_input("Enter constituent ticker (e.g. AAPL, MSFT, NVDA)", value="AAPL")
-    cticker = raw.strip().upper()
+    # ── Ticker search (selectbox backed by preloaded SECURITIES) ─────────
+    ticker_options = sorted(sec["constituent_ticker"].dropna().unique().tolist())
+    default_idx = ticker_options.index("AAPL") if "AAPL" in ticker_options else 0
+    cticker = st.selectbox("Select or type a constituent ticker", ticker_options, index=default_idx)
 
-    if not cticker:
-        st.info("Enter a ticker above to begin.")
+    # ── Security metadata from in-memory SECURITIES ───────────────────────
+    sec_row = sec[sec["constituent_ticker"] == cticker]
+    if sec_row.empty:
+        st.warning(f"**{cticker}** not found in SECURITIES master.")
         st.stop()
+    sec_meta = sec_row.iloc[0]
 
+    # ── ETF holdings from CONSTITUENTS (position/weight data only) ────────
     with st.spinner(f"Querying holdings for {cticker}…"):
         etf_rows = q(f"""
             SELECT
-                c.composite_ticker  AS etf_ticker,
-                i.description       AS etf_name,
+                c.composite_ticker   AS etf_ticker,
+                i.description        AS etf_name,
                 i.issuer,
                 i.asset_class,
                 i.category,
-                i.aum / 1e9         AS aum_bn,
+                i.aum / 1e9          AS aum_bn,
                 i.net_expenses * 100 AS net_expenses_bps,
-                c.constituent_name,
-                c.asset_class       AS security_asset_class,
-                c.security_type,
-                c.country_of_exchange,
-                c.currency_traded,
-                ROUND(c.weight, 4)  AS weight,
+                ROUND(c.weight, 4)   AS weight,
                 c.market_value,
                 c.shares_held
             FROM ETF_DB.LOCAL_COPY.CONSTITUENTS c
@@ -851,11 +855,11 @@ elif section == "📌 Security Lookup":
         """)
 
     if etf_rows.empty:
-        st.warning(f"**{cticker}** not found in any ETF on {BEST_DATE}. Check the ticker and try again.")
+        st.info(f"**{cticker}** exists in SECURITIES but has no holdings on {BEST_DATE}.")
         st.stop()
 
     # ── Security summary ──────────────────────────────────────────────────
-    sec_name = etf_rows["constituent_name"].iloc[0] or cticker
+    sec_name = sec_meta["constituent_name"] or cticker
     st.subheader(f"{cticker} — {sec_name}")
 
     c1, c2, c3, c4 = st.columns(4)
@@ -868,10 +872,13 @@ elif section == "📌 Security Lookup":
     with col1:
         st.markdown("**Security details**")
         st.table(pd.DataFrame({"Value": {
-            "Security Type":      etf_rows["security_type"].iloc[0] or "—",
-            "Asset Class":        etf_rows["security_asset_class"].iloc[0] or "—",
-            "Country of Exchange":etf_rows["country_of_exchange"].iloc[0] or "—",
-            "Currency Traded":    etf_rows["currency_traded"].iloc[0] or "—",
+            "Security Type":       sec_meta["security_type"]       or "—",
+            "Asset Class":         sec_meta["asset_class"]         or "—",
+            "Country of Exchange": sec_meta["country_of_exchange"] or "—",
+            "Currency Traded":     sec_meta["currency_traded"]     or "—",
+            "Exchange":            sec_meta["exchange"]            or "—",
+            "ISIN":                sec_meta["isin"]                or "—",
+            "CUSIP":               sec_meta["cusip"]               or "—",
         }}))
     with col2:
         asset_counts = etf_rows["asset_class"].fillna("Unknown").value_counts().reset_index()

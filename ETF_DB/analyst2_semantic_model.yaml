@@ -524,6 +524,121 @@ tables:
         data_type: NUMBER
         default_aggregation: avg
 
+  - name: SECURITIES
+    description: >
+      One row per unique security (constituent ticker) across all ETF holdings.
+      Contains security-level reference data: name, asset class, security type,
+      exchange, currency, and identifiers (CUSIP, ISIN). Deduplicated from
+      CONSTITUENTS using the most recent snapshot per ticker. No position,
+      weight, or ETF-specific data.
+    base_table:
+      database: ETF_DB
+      schema: LOCAL_COPY
+      table: SECURITIES
+    primary_key:
+      columns:
+        - constituent_ticker
+
+    dimensions:
+      - name: constituent_ticker
+        synonyms:
+          - "security ticker"
+          - "stock ticker"
+          - "holding ticker"
+          - "ticker symbol"
+        description: Unique ticker symbol of the security. Primary key.
+        expr: CONSTITUENT_TICKER
+        data_type: TEXT
+        unique: true
+        sample_values:
+          - "AAPL"
+          - "MSFT"
+          - "AMZN"
+          - "TLT"
+
+      - name: constituent_name
+        synonyms:
+          - "security name"
+          - "company name"
+          - "full name"
+        description: Full name of the security.
+        expr: CONSTITUENT_NAME
+        data_type: TEXT
+
+      - name: asset_class
+        synonyms:
+          - "security asset class"
+          - "asset type"
+        description: Asset class of the security (Equity, Fixed Income, Cash, etc.).
+        expr: ASSET_CLASS
+        data_type: TEXT
+        sample_values:
+          - "Equity"
+          - "Fixed Income"
+          - "Cash"
+
+      - name: security_type
+        synonyms:
+          - "instrument type"
+          - "security classification"
+        description: Type of security (Common Stock, Bond, REIT, ADR, etc.).
+        expr: SECURITY_TYPE
+        data_type: TEXT
+
+      - name: country_of_exchange
+        synonyms:
+          - "country"
+          - "listing country"
+          - "exchange country"
+        description: Country where the security is listed.
+        expr: COUNTRY_OF_EXCHANGE
+        data_type: TEXT
+        sample_values:
+          - "US"
+          - "GB"
+          - "JP"
+
+      - name: exchange
+        synonyms:
+          - "stock exchange"
+          - "trading venue"
+          - "listed exchange"
+        description: Exchange on which the security trades.
+        expr: EXCHANGE
+        data_type: TEXT
+        sample_values:
+          - "NEW YORK STOCK EXCHANGE, INC."
+          - "NASDAQ/NGS (GLOBAL SELECT MARKET)"
+          - "LONDON STOCK EXCHANGE"
+
+      - name: currency_traded
+        synonyms:
+          - "currency"
+          - "trading currency"
+        description: Currency in which the security trades.
+        expr: CURRENCY_TRADED
+        data_type: TEXT
+        sample_values:
+          - "USD"
+          - "EUR"
+          - "GBP"
+
+      - name: cusip
+        synonyms:
+          - "CUSIP code"
+          - "security identifier"
+        description: CUSIP identifier for the security.
+        expr: CUSIP
+        data_type: TEXT
+
+      - name: isin
+        synonyms:
+          - "ISIN code"
+          - "international identifier"
+        description: ISIN identifier for the security.
+        expr: ISIN
+        data_type: TEXT
+
 relationships:
   - name: constituents_to_industry
     left_table: CONSTITUENTS
@@ -532,4 +647,13 @@ relationships:
       - left_column: etf_ticker
         right_column: etf_ticker
     relationship_type: many_to_one
+    join_type: left_outer
+
+  - name: securities_to_constituents
+    left_table: SECURITIES
+    right_table: CONSTITUENTS
+    relationship_columns:
+      - left_column: constituent_ticker
+        right_column: constituent_ticker
+    relationship_type: one_to_many
     join_type: left_outer
