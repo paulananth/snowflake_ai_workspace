@@ -859,34 +859,109 @@ elif section == "📌 Security Lookup":
         st.stop()
 
     # ── Security summary ──────────────────────────────────────────────────
-    sec_name = sec_meta["constituent_name"] or cticker
-    st.subheader(f"{cticker} — {sec_name}")
+    sec_name = sec_meta.get("constituent_name") or cticker
+    active_flag = sec_meta.get("active_flag")
+    inactive_reason = sec_meta.get("inactive_reason")
 
+    # Header with active badge
+    badge_col, title_col = st.columns([1, 6])
+    with title_col:
+        st.subheader(f"{cticker} — {sec_name}")
+    with badge_col:
+        if active_flag is True:
+            st.success("ACTIVE")
+        elif active_flag is False:
+            reason_label = {
+                "not_in_edgar_tickers": "Not in EDGAR",
+                "no_recent_10k_10q": "Stale Filer",
+            }.get(inactive_reason or "", inactive_reason or "Inactive")
+            if (inactive_reason or "").startswith("deregistration"):
+                reason_label = "Deregistered"
+            st.error(f"INACTIVE\n{reason_label}")
+        else:
+            st.warning("STATUS\nUnknown")
+
+    # ── Top KPIs ──────────────────────────────────────────────────────────
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("ETFs holding it", f"{len(etf_rows):,}")
-    c2.metric("Avg Weight across ETFs", f"{etf_rows['weight'].mean():.4f}%")
-    c3.metric("Max Weight in any ETF", f"{etf_rows['weight'].max():.4f}%")
-    c4.metric("Total AUM exposed", f"${etf_rows['aum_bn'].sum():,.1f}B")
+    c1.metric("ETFs Holding", f"{len(etf_rows):,}")
+    c2.metric("Avg Weight", f"{etf_rows['weight'].mean():.4f}%")
+    c3.metric("Max Weight", f"{etf_rows['weight'].max():.4f}%")
+    c4.metric("Total AUM Exposed", f"${etf_rows['aum_bn'].sum():,.1f}B")
 
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        st.markdown("**Security details**")
-        st.table(pd.DataFrame({"Value": {
-            "Security Type":       sec_meta["security_type"]       or "—",
-            "Asset Class":         sec_meta["asset_class"]         or "—",
-            "Country of Exchange": sec_meta["country_of_exchange"] or "—",
-            "Currency Traded":     sec_meta["currency_traded"]     or "—",
-            "Exchange":            sec_meta["exchange"]            or "—",
-            "ISIN":                sec_meta["isin"]                or "—",
-            "CUSIP":               sec_meta["cusip"]               or "—",
-        }}))
-    with col2:
-        asset_counts = etf_rows["asset_class"].fillna("Unknown").value_counts().reset_index()
-        asset_counts.columns = ["asset_class", "count"]
-        fig = px.pie(asset_counts, values="count", names="asset_class",
-                     title="ETFs by Asset Class")
-        fig.update_traces(textposition="inside", textinfo="percent+label")
-        st.plotly_chart(fig, use_container_width=True)
+    st.divider()
+
+    # ── Two-column metadata layout ─────────────────────────────────────────
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        st.markdown("##### Identity")
+        def _v(key): return sec_meta.get(key) or "—"
+
+        identity_data = {
+            "Security Type":       _v("security_type"),
+            "Asset Class":         _v("asset_class"),
+            "Country of Exchange": _v("country_of_exchange"),
+            "Exchange":            _v("exchange"),
+            "Currency":            _v("currency_traded"),
+            "ISIN":                _v("isin"),
+            "CUSIP":               _v("cusip"),
+        }
+        st.table(pd.DataFrame({"Value": identity_data}))
+
+    with col_right:
+        st.markdown("##### SEC EDGAR")
+        cik_val = sec_meta.get("edgar_cik")
+        cik_display = (
+            f"[{cik_val}](https://www.sec.gov/cgi-bin/browse-edgar"
+            f"?action=getcompany&CIK={cik_val})"
+            if cik_val else "—"
+        )
+        sic = sec_meta.get("sic_code")
+        sic_desc = sec_meta.get("sic_description")
+        sic_display = f"{sic} — {sic_desc}" if sic and sic_desc else (sic or "—")
+
+        shares = sec_meta.get("shares_outstanding")
+        shares_date = sec_meta.get("shares_as_of_date")
+        if shares:
+            if shares >= 1e9:
+                shares_display = f"{shares/1e9:.2f}B"
+            elif shares >= 1e6:
+                shares_display = f"{shares/1e6:.1f}M"
+            else:
+                shares_display = f"{shares:,.0f}"
+            if shares_date:
+                shares_display += f" (as of {str(shares_date)[:10]})"
+        else:
+            shares_display = "—"
+
+        edgar_data = {
+            "CIK":               cik_display,
+            "EDGAR Name":        _v("edgar_name"),
+            "SIC":               sic_display,
+            "State of Inc.":     _v("state_of_inc"),
+            "Entity Type":       _v("entity_type"),
+            "EIN":               _v("ein"),
+            "Listed Exchanges":  _v("listed_exchanges"),
+            "Filer Category":    _v("filer_category"),
+            "Shares Outstanding":shares_display,
+        }
+        # Render as markdown table to support hyperlinks
+        st.markdown("| Field | Value |")
+        st.markdown("|-------|-------|")
+        for field, val in edgar_data.items():
+            st.markdown(f"| {field} | {val} |")
+
+        enriched_at = sec_meta.get("edgar_enriched_at")
+        if enriched_at:
+            st.caption(f"EDGAR data as of: {str(enriched_at)[:19]}")
+
+    # ── ETF exposure pie ───────────────────────────────────────────────────
+    asset_counts = etf_rows["asset_class"].fillna("Unknown").value_counts().reset_index()
+    asset_counts.columns = ["asset_class", "count"]
+    fig = px.pie(asset_counts, values="count", names="asset_class",
+                 title="ETFs Holding This Security — by Asset Class")
+    fig.update_traces(textposition="inside", textinfo="percent+label")
+    st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
 
