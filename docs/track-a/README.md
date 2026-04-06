@@ -26,7 +26,7 @@ flowchart TD
 
 Streamlit apps connect to Snowflake using:
 
-- Connection name: `myfirstsnow` from `~/.snowflake/config.toml`
+- Connection name: `snowconn` from `~/.snowflake/config.toml`
 - Warehouse: `cortex_analyst_wh` (hardcoded in the apps)
 
 ---
@@ -57,7 +57,7 @@ The Python apps read:
 
 - `~/.snowflake/config.toml`
 
-and look for a connection named `myfirstsnow`.
+and look for a connection named `snowconn`.
 
 If you do not already have this connection, create/update it in your local Snowflake config.
 
@@ -177,7 +177,7 @@ Use this section if you want an agent to “spin up Track A” end-to-end withou
 - A Snowflake account where the upstream source tables exist:
   - `ETF_CONSTITUENT_DATA.PUBLIC.CONSTITUENTS`
   - `ETF_INDUSTRY_DATA.PUBLIC.INDUSTRY`
-- A local Snowflake connection profile named `myfirstsnow` in `~/.snowflake/config.toml`
+- A local Snowflake connection profile named `snowconn` in `~/.snowflake/config.toml`
 - Python 3.11+ and `uv`
 
 ### Step-by-step procedure
@@ -210,7 +210,7 @@ Use this section if you want an agent to “spin up Track A” end-to-end withou
 
 - Symptom: apps error immediately on startup (Snowflake auth/connection errors).
 - Fix:
-  - Confirm `~/.snowflake/config.toml` has a connection named `myfirstsnow`
+  - Confirm `~/.snowflake/config.toml` has a connection named `snowconn`
   - Confirm your Snowflake user has access to warehouse `cortex_analyst_wh`
 
 ### Missing tables/objects

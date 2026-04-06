@@ -34,7 +34,7 @@ QUESTIONS = [
 ]
 
 
-def load_connection(connection_name: str = "myfirstsnow") -> dict:
+def load_connection(connection_name: str = "snowconn") -> dict:
     config_path = pathlib.Path.home() / ".snowflake" / "config.toml"
     with open(config_path, "rb") as f:
         config = tomllib.load(f)

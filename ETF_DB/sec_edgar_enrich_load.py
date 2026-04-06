@@ -179,7 +179,7 @@ def fetch_shares(cik: str, ticker: str, session: requests.Session) -> tuple[int 
 def snowflake_conn() -> snowflake.connector.SnowflakeConnection:
     config_path = pathlib.Path.home() / ".snowflake" / "config.toml"
     with open(config_path, "rb") as f:
-        cfg = tomllib.load(f)["connections"]["myfirstsnow"]
+        cfg = tomllib.load(f)["connections"]["snowconn"]
     return snowflake.connector.connect(
         account=cfg["account"], user=cfg["user"], password=cfg["password"],
         role=cfg.get("role", "ACCOUNTADMIN"), warehouse=cfg.get("warehouse", "cortex_analyst_wh"),

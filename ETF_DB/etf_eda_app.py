@@ -29,7 +29,7 @@ st.caption("Source: `ETF_DB.LOCAL_COPY` · CONSTITUENTS (1.17M rows) + INDUSTRY 
 def get_conn():
     config_path = pathlib.Path.home() / ".snowflake" / "config.toml"
     with open(config_path, "rb") as f:
-        cfg = tomllib.load(f)["connections"]["myfirstsnow"]
+        cfg = tomllib.load(f)["connections"]["snowconn"]
     return snowflake.connector.connect(
         account=cfg["account"], user=cfg["user"], password=cfg["password"],
         role=cfg.get("role", "ACCOUNTADMIN"), warehouse=cfg.get("warehouse", "cortex_analyst_wh"),

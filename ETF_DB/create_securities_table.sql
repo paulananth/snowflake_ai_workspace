@@ -6,7 +6,7 @@
 -- Part A: Pre-load validation (read-only profiling)
 -- Part B: Create + load with cleaning
 --
--- Run: snow sql -f ETF_DB/create_securities_table.sql --connection myfirstsnow
+-- Run: snow sql -f ETF_DB/create_securities_table.sql --connection snowconn
 -- ============================================================
 
 -- ── Part A: Validation ──────────────────────────────────────────────────────

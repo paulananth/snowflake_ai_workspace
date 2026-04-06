@@ -34,7 +34,7 @@ st.caption("Source: `ETF_DB.LOCAL_COPY.SECURITIES` — 113,855 unique tickers en
 def get_conn():
     config_path = pathlib.Path.home() / ".snowflake" / "config.toml"
     with open(config_path, "rb") as f:
-        cfg = tomllib.load(f)["connections"]["myfirstsnow"]
+        cfg = tomllib.load(f)["connections"]["snowconn"]
     return snowflake.connector.connect(
         account=cfg["account"], user=cfg["user"], password=cfg["password"],
         role=cfg.get("role", "ACCOUNTADMIN"), warehouse=cfg.get("warehouse", "cortex_analyst_wh"),
