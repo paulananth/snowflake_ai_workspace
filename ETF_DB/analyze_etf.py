@@ -34,11 +34,11 @@ QUESTIONS = [
 ]
 
 
-def load_connection(connection_name: str = "myfirstsnow") -> dict:
+def load_connection() -> dict:
     config_path = pathlib.Path.home() / ".snowflake" / "config.toml"
     with open(config_path, "rb") as f:
         config = tomllib.load(f)
-    name = config.get("default_connection_name", connection_name)
+    name = config.get("default_connection_name") or os.environ.get("SNOWFLAKE_CONNECTION", "snowconn")
     return config["connections"][name]
 
 
@@ -83,7 +83,7 @@ def main() -> None:
         user=cfg["user"],
         password=cfg["password"],
         role=cfg.get("role", "ACCOUNTADMIN"),
-        warehouse="cortex_analyst_wh",
+        warehouse=cfg.get("warehouse", "cortex_analyst_wh"),
     )
 
     account = cfg["account"].lower()

@@ -20,6 +20,7 @@ Run     : uv run ETF_DB/sec_edgar_enrich_load.py
 """
 
 import json
+import os
 import pathlib
 import re
 import time
@@ -179,10 +180,12 @@ def fetch_shares(cik: str, ticker: str, session: requests.Session) -> tuple[int 
 def snowflake_conn() -> snowflake.connector.SnowflakeConnection:
     config_path = pathlib.Path.home() / ".snowflake" / "config.toml"
     with open(config_path, "rb") as f:
-        cfg = tomllib.load(f)["connections"]["myfirstsnow"]
+        toml = tomllib.load(f)
+    conn_name = toml.get("default_connection_name") or os.environ.get("SNOWFLAKE_CONNECTION", "snowconn")
+    cfg = toml["connections"][conn_name]
     return snowflake.connector.connect(
         account=cfg["account"], user=cfg["user"], password=cfg["password"],
-        role=cfg.get("role", "ACCOUNTADMIN"), warehouse="cortex_analyst_wh",
+        role=cfg.get("role", "ACCOUNTADMIN"), warehouse=cfg.get("warehouse", "cortex_analyst_wh"),
     )
 
 

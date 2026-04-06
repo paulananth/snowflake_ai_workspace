@@ -81,9 +81,13 @@ GOLD_SCHEMA   = "gold"
 SEC_BASE_URL     = "https://data.sec.gov"
 SEC_FILES_URL    = "https://www.sec.gov/files"
 USER_AGENT       = "MyOrg DataPipeline contact@myorg.com"  # CHANGE THIS — required by SEC
-REQUEST_DELAY_S  = 0.15    # seconds between HTTP requests (≤10 req/s per SEC policy)
 REQUEST_TIMEOUT  = 30
 MAX_RETRIES      = 3
+
+# Bulk ingestion tuning
+INGEST_WORKERS   = 8      # parallel HTTP threads (ThreadPoolExecutor max_workers)
+INGEST_RATE_RPS  = 8.0    # max requests/sec globally across all threads (SEC allows 10)
+BATCH_SIZE       = 500    # CIKs accumulated in memory before flushing to Parquet
 
 # Exchange filter for active equities
 TARGET_EXCHANGES = ["NYSE", "Nasdaq"]
@@ -709,88 +713,303 @@ def period_days(start: str, end: str) -> int:
 
 ## 11. Pipeline Scripts
 
-All scripts live under `scripts/`. They are standalone Python files that run either locally (for the HTTP ingestion driver) or as Databricks notebooks/jobs (for Spark-based Silver/Gold transforms).
+All scripts live under `scripts/`. HTTP ingestion runs as single-node Python (not PySpark) to maintain SEC rate-limit control. Spark notebooks handle Bronze→Silver→Gold transforms.
+
+### 11.0 Ingestion Design Principles
+
+**Batched parallel fetching** (applies to all per-CIK ingestion scripts):
+
+- `ThreadPoolExecutor(max_workers=8)` fetches 8 CIKs in parallel
+- A shared `RateLimiter` enforces ≤8 req/s globally across all threads (below SEC's 10 req/s limit)
+- Results accumulate in memory and are flushed to Parquet every `BATCH_SIZE=500` CIKs
+- This reduces object storage writes from ~8,000 small files to ~16 batch files per dataset per day
+
+**Object storage layout (batch files, not per-CIK files):**
+```
+{STORAGE_ROOT}/bronze/submissions/ingestion_date=2024-01-25/
+  batch_0001.parquet    ← 500 CIKs
+  batch_0002.parquet    ← 500 CIKs
+  ...
+  batch_0016.parquet    ← remainder
+```
+
+**Rate Limiter (shared across all threads):**
+```python
+# scripts/ingest/_rate_limiter.py
+import threading, time
+
+class RateLimiter:
+    """Thread-safe token-bucket rate limiter."""
+    def __init__(self, rate: float):        # rate = max requests per second
+        self._interval = 1.0 / rate
+        self._lock = threading.Lock()
+        self._last_call = 0.0
+
+    def acquire(self):
+        with self._lock:
+            now = time.monotonic()
+            wait = self._interval - (now - self._last_call)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_call = time.monotonic()
+```
+
+**Retry wrapper (shared):**
+```python
+# scripts/ingest/_http.py
+import requests, time
+from ._rate_limiter import RateLimiter
+
+_limiter = RateLimiter(rate=8.0)           # 8 req/s; SEC allows 10, leave headroom
+
+def edgar_get(url: str, session: requests.Session, max_retries: int = 3):
+    for attempt in range(max_retries):
+        _limiter.acquire()
+        try:
+            r = session.get(url, timeout=30)
+        except requests.exceptions.ConnectionError:
+            time.sleep(2 ** attempt)
+            continue
+        if r.status_code == 429:
+            time.sleep(60)
+            continue
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+    return None                             # exhausted retries
+```
+
+**Batch writer (shared):**
+```python
+# scripts/ingest/_batch_writer.py
+import pyarrow as pa, pyarrow.parquet as pq
+from pathlib import PurePosixPath
+
+def write_batch(records: list[dict], schema: pa.Schema,
+                storage_root: str, dataset: str,
+                ingest_date: str, batch_num: int):
+    table = pa.Table.from_pylist(records, schema=schema)
+    path = f"{storage_root}/bronze/{dataset}/ingestion_date={ingest_date}/batch_{batch_num:04d}.parquet"
+    pq.write_table(table, path, compression="snappy")
+    return path
+```
 
 ### 11.1 `scripts/ingest/01_ingest_tickers_exchange.py` — Daily Tickers Snapshot
 
-Single-node Python. Downloads `company_tickers_exchange.json`, writes Parquet to object storage, then loads Bronze Delta table.
+Single HTTP call (one file, not per-CIK). No threading needed.
 
 ```python
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["requests", "pyarrow", "pandas"]
-# ///
-
 """
 Usage: python scripts/ingest/01_ingest_tickers_exchange.py [--date YYYY-MM-DD]
-Default date = today. Idempotent — skips if parquet file already exists for that date.
+Idempotent — skips if Parquet already exists for that date.
 """
-
-import requests, pandas as pd, pyarrow as pa, pyarrow.parquet as pq
+import requests, pyarrow as pa, pyarrow.parquet as pq, sys
 from datetime import date
-from pathlib import PurePosixPath
-import sys, os
-
-sys.path.insert(0, str(Path(__file__).parents[2]))
-from config.settings import STORAGE_ROOT, USER_AGENT, REQUEST_DELAY_S, TARGET_EXCHANGES
+from config.settings import STORAGE_ROOT, USER_AGENT
 
 def run(ingest_date: date):
-    url = "https://www.sec.gov/files/company_tickers_exchange.json"
-    headers = {"User-Agent": USER_AGENT, "Accept-Encoding": "gzip"}
+    out_path = f"{STORAGE_ROOT}/bronze/company_tickers_exchange/ingestion_date={ingest_date}/data.parquet"
+    # Idempotency check
+    try:
+        pq.read_metadata(out_path)
+        print(f"Already exists: {out_path}, skipping.")
+        return
+    except Exception:
+        pass
 
-    resp = requests.get(url, headers=headers, timeout=30)
+    resp = requests.get(
+        "https://www.sec.gov/files/company_tickers_exchange.json",
+        headers={"User-Agent": USER_AGENT, "Accept-Encoding": "gzip"},
+        timeout=30,
+    )
     resp.raise_for_status()
     payload = resp.json()
 
-    df = pd.DataFrame(payload["data"], columns=payload["fields"])
-    df["ingestion_date"] = ingest_date.isoformat()
-    df["source_file_path"] = f"{STORAGE_ROOT}/bronze/company_tickers_exchange/ingestion_date={ingest_date}/data.parquet"
-
-    out_path = f"{STORAGE_ROOT}/bronze/company_tickers_exchange/ingestion_date={ingest_date}/data.parquet"
-    # Write to object storage (uses configured cloud credentials from environment)
-    pq.write_table(pa.Table.from_pandas(df), out_path)
-    print(f"Written {len(df)} rows to {out_path}")
+    records = [
+        {"cik": row[0], "company_name": row[1], "ticker": row[2],
+         "exchange": row[3], "ingestion_date": ingest_date.isoformat()}
+        for row in payload["data"]
+    ]
+    table = pa.Table.from_pylist(records)
+    pq.write_table(table, out_path, compression="snappy")
+    print(f"Written {len(records)} rows → {out_path}")
 
 if __name__ == "__main__":
     d = date.fromisoformat(sys.argv[1]) if len(sys.argv) > 1 else date.today()
     run(d)
 ```
 
-After writing Parquet, load into Bronze Delta via Spark (run in Databricks notebook):
+### 11.2 `scripts/ingest/02_ingest_submissions.py` — Bulk Submissions
+
+Fetches all CIK submissions in parallel batches. Completes before any Silver job starts.
+
 ```python
-spark.read.parquet(f"{STORAGE_ROOT}/bronze/company_tickers_exchange/ingestion_date={ingest_date}/") \
-    .write.format("delta").mode("append") \
-    .option("mergeSchema", "false") \
-    .saveAsTable("sec_edgar_platform.bronze.company_tickers_exchange_raw")
+"""
+Usage: python scripts/ingest/02_ingest_submissions.py [--date YYYY-MM-DD] [--limit N]
+--limit: for dev/testing, process only first N CIKs.
+Idempotent — resumes from last incomplete batch.
+"""
+import sys, requests, pyarrow as pa, pyarrow.parquet as pq
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date
+from config.settings import (STORAGE_ROOT, USER_AGENT, TARGET_EXCHANGES,
+                              INGEST_WORKERS, BATCH_SIZE)
+from scripts.ingest._http import edgar_get
+from scripts.ingest._batch_writer import write_batch
+
+SUBMISSIONS_SCHEMA = pa.schema([
+    pa.field("ingestion_date",         pa.string()),
+    pa.field("cik",                    pa.int64()),
+    pa.field("entity_name",            pa.string()),
+    pa.field("entity_type",            pa.string()),
+    pa.field("sic",                    pa.string()),
+    pa.field("sic_description",        pa.string()),
+    pa.field("ein",                    pa.string()),
+    pa.field("category",               pa.string()),
+    pa.field("fiscal_year_end",        pa.string()),
+    pa.field("state_of_incorporation", pa.string()),
+    pa.field("tickers_json",           pa.string()),
+    pa.field("exchanges_json",         pa.string()),
+    pa.field("filings_recent_json",    pa.string()),
+    pa.field("filings_files_json",     pa.string()),
+])
+
+def fetch_one(cik: int, session: requests.Session, ingest_date: str) -> dict | None:
+    url = f"https://data.sec.gov/submissions/CIK{str(cik).zfill(10)}.json"
+    data = edgar_get(url, session)
+    if data is None:
+        return None
+    import json
+    return {
+        "ingestion_date":          ingest_date,
+        "cik":                     cik,
+        "entity_name":             data.get("name"),
+        "entity_type":             data.get("entityType"),
+        "sic":                     data.get("sic"),
+        "sic_description":         data.get("sicDescription"),
+        "ein":                     data.get("ein"),
+        "category":                data.get("category"),
+        "fiscal_year_end":         data.get("fiscalYearEnd"),
+        "state_of_incorporation":  data.get("stateOfIncorporation"),
+        "tickers_json":            json.dumps(data.get("tickers", [])),
+        "exchanges_json":          json.dumps(data.get("exchanges", [])),
+        "filings_recent_json":     json.dumps(data.get("filings", {}).get("recent", {})),
+        "filings_files_json":      json.dumps(data.get("filings", {}).get("files", [])),
+    }
+
+def run(ingest_date: date, limit: int | None = None):
+    # 1. Load CIK list from tickers Parquet (already written by script 01)
+    tickers_path = f"{STORAGE_ROOT}/bronze/company_tickers_exchange/ingestion_date={ingest_date}/data.parquet"
+    tickers = pq.read_table(tickers_path, columns=["cik", "exchange"]).to_pydict()
+    cik_list = [
+        cik for cik, exch in zip(tickers["cik"], tickers["exchange"])
+        if exch in TARGET_EXCHANGES
+    ]
+    if limit:
+        cik_list = cik_list[:limit]
+    print(f"Processing {len(cik_list)} CIKs with {INGEST_WORKERS} workers, batch size {BATCH_SIZE}")
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT, "Accept-Encoding": "gzip"})
+
+    batch_num, buffer, ok, err = 1, [], 0, 0
+
+    # 2. Parallel fetch with shared rate limiter
+    with ThreadPoolExecutor(max_workers=INGEST_WORKERS) as pool:
+        futures = {pool.submit(fetch_one, cik, session, ingest_date.isoformat()): cik
+                   for cik in cik_list}
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                buffer.append(result)
+                ok += 1
+            else:
+                err += 1
+            # 3. Flush batch to Parquet every BATCH_SIZE records
+            if len(buffer) >= BATCH_SIZE:
+                path = write_batch(buffer, SUBMISSIONS_SCHEMA,
+                                   STORAGE_ROOT, "submissions",
+                                   ingest_date.isoformat(), batch_num)
+                print(f"  Batch {batch_num:04d}: {len(buffer)} rows → {path}")
+                batch_num += 1
+                buffer = []
+
+    # 4. Final partial batch
+    if buffer:
+        write_batch(buffer, SUBMISSIONS_SCHEMA, STORAGE_ROOT,
+                    "submissions", ingest_date.isoformat(), batch_num)
+
+    print(f"Done. ok={ok} err={err} batches={batch_num}")
+
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--date", default=date.today().isoformat())
+    p.add_argument("--limit", type=int, default=None)
+    args = p.parse_args()
+    run(date.fromisoformat(args.date), args.limit)
 ```
 
-### 11.2 `scripts/ingest/02_ingest_submissions.py` — Daily Submissions per CIK
+### 11.3 `scripts/ingest/03_ingest_companyfacts.py` — Bulk Company Facts (XBRL)
 
-Single-node Python. Iterates over all CIKs from the latest tickers snapshot, fetches `submissions/CIK{cik}.json`, writes one Parquet file per CIK.
+Identical pattern to `02_ingest_submissions.py`. Stores the full `facts` JSON as a single string column (2–5 MB per CIK). Batch Parquet files will be large (~1–2 GB each) — this is correct and expected.
 
-**Rate limiting:** `time.sleep(REQUEST_DELAY_S)` between every request.
+```python
+COMPANYFACTS_SCHEMA = pa.schema([
+    pa.field("ingestion_date",   pa.string()),
+    pa.field("cik",              pa.int64()),
+    pa.field("entity_name",      pa.string()),
+    pa.field("facts_json",       pa.string()),   # full {"us-gaap":{...},"dei":{...}}
+])
 
-**Execution flow:**
+def fetch_one(cik: int, session, ingest_date: str) -> dict | None:
+    import json
+    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{str(cik).zfill(10)}.json"
+    data = edgar_get(url, session)
+    if data is None:
+        return None
+    return {
+        "ingestion_date": ingest_date,
+        "cik":            cik,
+        "entity_name":    data.get("entityName"),
+        "facts_json":     json.dumps(data.get("facts", {})),
+    }
+# run() identical to 02_ingest_submissions.py — swap SCHEMA and fetch_one
 ```
-1. Read today's CIKs from {STORAGE_ROOT}/bronze/company_tickers_exchange/ingestion_date={today}/
-2. For each CIK (filtered to TARGET_EXCHANGES):
-   a. Check if {STORAGE_ROOT}/bronze/submissions/ingestion_date={today}/cik={cik10}/ exists → skip if yes
-   b. GET https://data.sec.gov/submissions/CIK{cik10}.json
-   c. If filings.files is non-empty, fetch continuation pages (cap at 5)
-   d. Write Parquet: {STORAGE_ROOT}/bronze/submissions/ingestion_date={today}/cik={cik10}/data.parquet
-   e. sleep(REQUEST_DELAY_S)
-3. Log: N fetched, N skipped, N errors
+
+### 11.4 `scripts/ingest/04_load_bronze_delta.py` — Bulk Bronze Delta Load (Spark)
+
+Runs **after all three ingestion scripts complete**. Loads all batch Parquet files into their Delta tables using `COPY INTO` (idempotent, tracks already-loaded files).
+
+```python
+# Databricks notebook / PySpark script
+from datetime import date
+from config.settings import STORAGE_ROOT, CATALOG_NAME
+
+today = date.today().isoformat()
+
+# Load each dataset — COPY INTO is idempotent (skips already-loaded files)
+for dataset, table in [
+    ("company_tickers_exchange", "bronze.company_tickers_exchange_raw"),
+    ("submissions",              "bronze.submissions_raw"),
+    ("companyfacts",             "bronze.companyfacts_raw"),
+]:
+    path = f"{STORAGE_ROOT}/bronze/{dataset}/ingestion_date={today}/"
+    spark.sql(f"""
+        COPY INTO {CATALOG_NAME}.{table}
+        FROM '{path}'
+        FILEFORMAT = PARQUET
+        FORMAT_OPTIONS ('inferSchema' = 'false', 'mergeSchema' = 'false')
+        COPY_OPTIONS ('mergeSchema' = 'false')
+    """)
+    count = spark.sql(f"SELECT COUNT(*) FROM {CATALOG_NAME}.{table} WHERE ingestion_date = '{today}'").collect()[0][0]
+    print(f"{table}: loaded {count:,} rows for {today}")
 ```
 
-### 11.3 `scripts/ingest/03_ingest_companyfacts.py` — Daily Company Facts (XBRL)
+### 11.5 `scripts/bronze_to_silver/01_silver_dim_security.py` — Security Master
 
-Identical pattern to submissions. Fetches `companyfacts/CIK{cik10}.json`. The facts JSON (~2–5 MB) is stored as a single string column in the Parquet.
-
-**Skip condition:** CIKs not in TARGET_EXCHANGES exchange list; CIKs that returned 404 previously (tracked in a local checkpoint file).
-
-### 11.4 `scripts/bronze_to_silver/01_silver_dim_security.py` — Security Master (Databricks Notebook)
-
-PySpark. Reads latest Bronze `company_tickers_exchange_raw`, computes `security_id`, MERGEs into `silver.dim_security`.
+Reads from Bronze `company_tickers_exchange_raw` (today's partition only). Computes `security_id` and MERGEs into `silver.dim_security`.
 
 ```python
 from pyspark.sql import functions as F
@@ -804,86 +1023,58 @@ bronze = spark.table("sec_edgar_platform.bronze.company_tickers_exchange_raw") \
 
 silver_candidates = bronze.withColumn(
     "security_id",
-    F.left(F.sha2(
-        F.concat(F.lpad(F.col("cik").cast("string"), 10, "0"),
-                 F.lit("|"),
-                 F.upper(F.coalesce(F.lit("PRIMARY"), F.lit("PRIMARY")))),
-        256), 16)
+    F.left(F.sha2(F.concat(
+        F.lpad(F.col("cik").cast("string"), 10, "0"),
+        F.lit("|"),
+        F.lit("PRIMARY")), 256), 16)
 ).withColumn("active_flag", F.lit(True)) \
  .withColumn("first_seen_date", F.lit(today).cast("date")) \
- .withColumn("last_seen_date", F.lit(today).cast("date"))
+ .withColumn("last_seen_date",  F.lit(today).cast("date"))
 
-# MERGE into silver.dim_security
 silver_candidates.createOrReplaceTempView("new_securities")
 
 spark.sql("""
-  MERGE INTO sec_edgar_platform.silver.dim_security AS target
-  USING new_securities AS source
-  ON target.security_id = source.security_id
+  MERGE INTO sec_edgar_platform.silver.dim_security AS t
+  USING new_securities AS s ON t.security_id = s.security_id
   WHEN MATCHED THEN UPDATE SET
-    target.last_seen_date = source.last_seen_date,
-    target.company_name   = source.company_name,
-    target.exchange       = source.exchange,
-    target.updated_at     = current_timestamp()
+    t.last_seen_date = s.last_seen_date,
+    t.company_name   = s.company_name,
+    t.exchange       = s.exchange,
+    t.updated_at     = current_timestamp()
   WHEN NOT MATCHED THEN INSERT *
 """)
 ```
 
-### 11.5 `scripts/bronze_to_silver/02_silver_filings_and_facts.py`
+### 11.6 `scripts/bronze_to_silver/02_silver_filings_and_facts.py`
 
-PySpark. Reads Bronze `submissions_raw` and `companyfacts_raw`, parses JSON, applies XBRL concept extraction logic, MERGEs into `silver.filings_index`, `silver.financial_facts`, `silver.corporate_actions`.
+PySpark. Reads Bronze `submissions_raw` and `companyfacts_raw` (today's partition). Parses filings parallel arrays and XBRL concepts. MERGEs into `silver.filings_index`, `silver.financial_facts`, `silver.corporate_actions`.
 
-Key parsing (PySpark):
-```python
-# Parse parallel arrays from filings.recent JSON
-from_json_schema = "struct<accessionNumber:array<string>, filingDate:array<string>, ...>"
+### 11.7 `scripts/silver_to_gold/01_build_gold.py`
 
-filings_df = submissions_raw \
-    .withColumn("filings", F.from_json("filings_recent_json", from_json_schema)) \
-    .select(
-        "cik",
-        F.posexplode("filings.accessionNumber").alias("pos", "accession_number"),
-        # ... join other arrays by pos
-    )
-```
-
-XBRL facts parsing: explode `facts_json` by taxonomy → concept → unit → data points, then filter by period duration.
-
-### 11.6 `scripts/silver_to_gold/01_build_gold.py`
-
-PySpark. Truncates and rebuilds all Gold tables from Silver. Run after Silver is complete.
-
-```python
-# Rebuild gold.financial_statements_annual
-spark.sql("""
-  CREATE OR REPLACE TABLE sec_edgar_platform.gold.financial_statements_annual
-  USING DELTA
-  CLUSTER BY (ticker, fiscal_year)
-  AS
-  SELECT
-    f.security_id, f.cik, s.ticker, s.company_name, s.exchange,
-    f.fiscal_year, f.period_end, f.filed_date, f.taxonomy,
-    f.revenues, f.net_income, f.operating_income,
-    f.total_assets, f.total_liabilities, f.stockholders_equity,
-    f.long_term_debt, f.cash_and_equivalents, f.operating_cash_flow,
-    f.eps_basic, f.eps_diluted,
-    ROUND(f.net_income / NULLIF(f.revenues, 0), 6)             AS net_margin,
-    ROUND(f.net_income / NULLIF(f.stockholders_equity, 0), 6)  AS return_on_equity,
-    ROUND(f.long_term_debt / NULLIF(f.stockholders_equity, 0), 6) AS debt_to_equity,
-    current_timestamp() AS refreshed_at
-  FROM sec_edgar_platform.silver.financial_facts f
-  JOIN sec_edgar_platform.silver.dim_security s ON s.security_id = f.security_id
-  WHERE f.form_type IN ('10-K', '10-K/A')
-    AND f.fiscal_period = 'FY'
-    AND s.active_flag = TRUE
-""")
-```
+PySpark. Rebuilds all Gold tables from Silver using `CREATE OR REPLACE TABLE ... AS SELECT`. See Section 9 for the SQL patterns.
 
 ---
 
 ## 12. Databricks Workflow YAML
 
 Save as `workflows/sec_edgar_daily.yml`. Deploy with `databricks bundle deploy`.
+
+**Pipeline execution order (enforced by task dependencies):**
+```
+ingest_tickers ──────────────────────────────────────────────────────────────────────┐
+                                                                                     │
+ingest_tickers → ingest_submissions (bulk parallel, 8 workers) ──────────────────────┤
+                                                                                     ├─→ load_bronze_delta → [GATE: bronze_ingestion_complete]
+ingest_tickers → ingest_companyfacts (bulk parallel, 8 workers) ─────────────────────┘                              │
+                                                                                                                     ▼
+                                                                                                         silver_security_master
+                                                                                                                     │
+                                                                                                         silver_filings_facts
+                                                                                                                     │
+                                                                                                             build_gold
+```
+
+**Rule:** No Silver or Gold task may start until `bronze_ingestion_complete` succeeds.
 
 ```yaml
 # workflows/sec_edgar_daily.yml
@@ -898,26 +1089,29 @@ resources:
         quartz_cron_expression: "0 0 6 * * ?"    # 06:00 UTC daily
         timezone_id: "UTC"
       job_clusters:
-        - job_cluster_key: silver_gold_cluster
+        - job_cluster_key: spark_cluster
           new_cluster:
             spark_version: "15.4.x-scala2.12"
             node_type_id: "i3.xlarge"            # change for your cloud
             num_workers: 2
             spark_conf:
               spark.databricks.delta.optimizeWrite.enabled: "true"
+              spark.databricks.delta.optimizeWrite.binSize: "1073741824"  # 1 GB bins
 
       tasks:
+
+        # ── STAGE 1: Download tickers (1 HTTP call, prerequisite for CIK list) ──────
         - task_key: ingest_tickers
-          description: "Download company_tickers_exchange.json → Parquet → Bronze"
+          description: "Download company_tickers_exchange.json → Parquet (1 file)"
           spark_python_task:
             python_file: "scripts/ingest/01_ingest_tickers_exchange.py"
           libraries:
             - pypi: { package: "requests" }
             - pypi: { package: "pyarrow" }
-            - pypi: { package: "pandas" }
 
+        # ── STAGE 2: Bulk parallel HTTP fetch (submissions + facts run concurrently) ─
         - task_key: ingest_submissions
-          description: "Fetch submissions JSON per CIK → Parquet → Bronze"
+          description: "Bulk fetch submissions (8 workers, batch Parquet)"
           depends_on: [{ task_key: ingest_tickers }]
           spark_python_task:
             python_file: "scripts/ingest/02_ingest_submissions.py"
@@ -926,7 +1120,7 @@ resources:
             - pypi: { package: "pyarrow" }
 
         - task_key: ingest_companyfacts
-          description: "Fetch companyfacts JSON per CIK → Parquet → Bronze"
+          description: "Bulk fetch companyfacts/XBRL (8 workers, batch Parquet)"
           depends_on: [{ task_key: ingest_tickers }]
           spark_python_task:
             python_file: "scripts/ingest/03_ingest_companyfacts.py"
@@ -934,27 +1128,50 @@ resources:
             - pypi: { package: "requests" }
             - pypi: { package: "pyarrow" }
 
+        # ── STAGE 3: Load all Parquet batches into Bronze Delta (COPY INTO) ─────────
+        - task_key: load_bronze_delta
+          description: "COPY INTO all batch Parquet files → Bronze Delta tables"
+          depends_on:
+            - { task_key: ingest_tickers }
+            - { task_key: ingest_submissions }
+            - { task_key: ingest_companyfacts }
+          job_cluster_key: spark_cluster
+          notebook_task:
+            notebook_path: "scripts/ingest/04_load_bronze_delta"
+
+        # ── GATE: all raw data in Delta before any Silver/Gold task starts ──────────
+        - task_key: bronze_ingestion_complete
+          description: "GATE — verifies row counts in all Bronze tables for today"
+          depends_on: [{ task_key: load_bronze_delta }]
+          job_cluster_key: spark_cluster
+          notebook_task:
+            notebook_path: "scripts/ingest/05_verify_bronze_complete"
+          # This notebook asserts:
+          #   bronze.company_tickers_exchange_raw has rows for today
+          #   bronze.submissions_raw has rows for today
+          #   bronze.companyfacts_raw has rows for today
+          # Raises exception (fails the task) if any assertion fails → stops pipeline
+
+        # ── STAGE 4: Silver transforms (only start after bronze_ingestion_complete) ──
         - task_key: silver_security_master
           description: "Bronze → Silver: dim_security + security_xref"
-          depends_on: [{ task_key: ingest_tickers }]
-          job_cluster_key: silver_gold_cluster
+          depends_on: [{ task_key: bronze_ingestion_complete }]
+          job_cluster_key: spark_cluster
           notebook_task:
             notebook_path: "scripts/bronze_to_silver/01_silver_dim_security"
 
         - task_key: silver_filings_facts
           description: "Bronze → Silver: filings_index + financial_facts + corporate_actions"
-          depends_on:
-            - { task_key: ingest_submissions }
-            - { task_key: ingest_companyfacts }
-            - { task_key: silver_security_master }
-          job_cluster_key: silver_gold_cluster
+          depends_on: [{ task_key: silver_security_master }]
+          job_cluster_key: spark_cluster
           notebook_task:
             notebook_path: "scripts/bronze_to_silver/02_silver_filings_and_facts"
 
+        # ── STAGE 5: Gold (only after all Silver complete) ────────────────────────────
         - task_key: build_gold
           description: "Silver → Gold: all analytics tables"
           depends_on: [{ task_key: silver_filings_facts }]
-          job_cluster_key: silver_gold_cluster
+          job_cluster_key: spark_cluster
           notebook_task:
             notebook_path: "scripts/silver_to_gold/01_build_gold"
 ```
@@ -974,9 +1191,14 @@ sec_edgar_platform/
 │   │   ├── 02_create_silver_tables.sql
 │   │   └── 03_create_gold_tables.sql
 │   ├── ingest/
-│   │   ├── 01_ingest_tickers_exchange.py   ← single-node Python
-│   │   ├── 02_ingest_submissions.py
-│   │   └── 03_ingest_companyfacts.py
+│   │   ├── _rate_limiter.py                ← shared RateLimiter (8 req/s)
+│   │   ├── _http.py                        ← edgar_get() with retry + rate limit
+│   │   ├── _batch_writer.py                ← write_batch() bulk Parquet writer
+│   │   ├── 01_ingest_tickers_exchange.py   ← 1 HTTP call, 1 Parquet file
+│   │   ├── 02_ingest_submissions.py        ← bulk: 8 workers, batch Parquet
+│   │   ├── 03_ingest_companyfacts.py       ← bulk: 8 workers, batch Parquet
+│   │   ├── 04_load_bronze_delta.py         ← COPY INTO all batches → Delta
+│   │   └── 05_verify_bronze_complete.py    ← GATE: asserts row counts > 0
 │   ├── bronze_to_silver/
 │   │   ├── 01_silver_dim_security.py       ← Databricks notebook/PySpark
 │   │   └── 02_silver_filings_and_facts.py

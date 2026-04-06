@@ -1,6 +1,6 @@
 -- ============================================================
 -- Add EDGAR enrichment columns to SECURITIES table
--- Run: snow sql -f ETF_DB/add_edgar_columns.sql --connection myfirstsnow
+-- Run: snow sql -f ETF_DB/add_edgar_columns.sql --connection snowconn
 -- ============================================================
 
 ALTER TABLE etf_db.local_copy.SECURITIES ADD COLUMN IF NOT EXISTS EDGAR_CIK          TEXT;

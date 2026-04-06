@@ -12,6 +12,7 @@ Equity Securities Dashboard
 Analysis of ASSET_CLASS = 'Equity' securities only.
 Run: uv run --with streamlit --with pandas --with plotly --with snowflake-connector-python python -m streamlit run ETF_DB/equity_dashboard.py
 """
+import os
 import pathlib
 import tomllib
 
@@ -69,10 +70,12 @@ st.caption(
 def get_conn():
     config_path = pathlib.Path.home() / ".snowflake" / "config.toml"
     with open(config_path, "rb") as f:
-        cfg = tomllib.load(f)["connections"]["myfirstsnow"]
+        toml = tomllib.load(f)
+    conn_name = toml.get("default_connection_name") or os.environ.get("SNOWFLAKE_CONNECTION", "snowconn")
+    cfg = toml["connections"][conn_name]
     return snowflake.connector.connect(
         account=cfg["account"], user=cfg["user"], password=cfg["password"],
-        role=cfg.get("role", "ACCOUNTADMIN"), warehouse="cortex_analyst_wh",
+        role=cfg.get("role", "ACCOUNTADMIN"), warehouse=cfg.get("warehouse", "cortex_analyst_wh"),
     )
 
 @st.cache_data(ttl=3600)

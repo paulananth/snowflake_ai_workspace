@@ -26,8 +26,8 @@ flowchart TD
 
 Streamlit apps connect to Snowflake using:
 
-- Connection name: `myfirstsnow` from `~/.snowflake/config.toml`
-- Warehouse: `cortex_analyst_wh` (hardcoded in the apps)
+- Connection name: resolved in order — `default_connection_name` in `~/.snowflake/config.toml`, then `SNOWFLAKE_CONNECTION` env var, then `snowconn` as fallback
+- Warehouse: read from the `warehouse` key in the connection block of `~/.snowflake/config.toml` (falls back to `cortex_analyst_wh` if not set)
 
 ---
 
@@ -57,9 +57,12 @@ The Python apps read:
 
 - `~/.snowflake/config.toml`
 
-and look for a connection named `myfirstsnow`.
+The connection name is resolved in this order:
+1. `default_connection_name` field in `~/.snowflake/config.toml`
+2. `SNOWFLAKE_CONNECTION` environment variable
+3. Falls back to `snowconn` if neither is set
 
-If you do not already have this connection, create/update it in your local Snowflake config.
+If you do not already have a connection configured, add one to `~/.snowflake/config.toml`.
 
 ### 3) Python tooling
 
@@ -177,7 +180,7 @@ Use this section if you want an agent to “spin up Track A” end-to-end withou
 - A Snowflake account where the upstream source tables exist:
   - `ETF_CONSTITUENT_DATA.PUBLIC.CONSTITUENTS`
   - `ETF_INDUSTRY_DATA.PUBLIC.INDUSTRY`
-- A local Snowflake connection profile named `myfirstsnow` in `~/.snowflake/config.toml`
+- A local Snowflake connection profile in `~/.snowflake/config.toml` (set via `default_connection_name`, `SNOWFLAKE_CONNECTION` env var, or a connection named `snowconn`)
 - Python 3.11+ and `uv`
 
 ### Step-by-step procedure
@@ -210,8 +213,8 @@ Use this section if you want an agent to “spin up Track A” end-to-end withou
 
 - Symptom: apps error immediately on startup (Snowflake auth/connection errors).
 - Fix:
-  - Confirm `~/.snowflake/config.toml` has a connection named `myfirstsnow`
-  - Confirm your Snowflake user has access to warehouse `cortex_analyst_wh`
+  - Confirm `~/.snowflake/config.toml` has a valid connection (set via `default_connection_name`, `SNOWFLAKE_CONNECTION` env var, or a connection named `snowconn`)
+  - Confirm your Snowflake user has access to the warehouse set in your connection config (defaults to `cortex_analyst_wh` if not specified)
 
 ### Missing tables/objects
 
