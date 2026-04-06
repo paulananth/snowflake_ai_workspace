@@ -12,6 +12,7 @@ Securities Master Dashboard
 Insights on the SECURITIES table including EDGAR enrichment results.
 Run: uv run streamlit run ETF_DB/securities_dashboard.py
 """
+import os
 import pathlib
 import tomllib
 
@@ -34,7 +35,9 @@ st.caption("Source: `ETF_DB.LOCAL_COPY.SECURITIES` — 113,855 unique tickers en
 def get_conn():
     config_path = pathlib.Path.home() / ".snowflake" / "config.toml"
     with open(config_path, "rb") as f:
-        cfg = tomllib.load(f)["connections"]["snowconn"]
+        toml = tomllib.load(f)
+    conn_name = toml.get("default_connection_name") or os.environ.get("SNOWFLAKE_CONNECTION", "snowconn")
+    cfg = toml["connections"][conn_name]
     return snowflake.connector.connect(
         account=cfg["account"], user=cfg["user"], password=cfg["password"],
         role=cfg.get("role", "ACCOUNTADMIN"), warehouse=cfg.get("warehouse", "cortex_analyst_wh"),

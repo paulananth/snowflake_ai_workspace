@@ -34,11 +34,11 @@ QUESTIONS = [
 ]
 
 
-def load_connection(connection_name: str = "snowconn") -> dict:
+def load_connection() -> dict:
     config_path = pathlib.Path.home() / ".snowflake" / "config.toml"
     with open(config_path, "rb") as f:
         config = tomllib.load(f)
-    name = config.get("default_connection_name", connection_name)
+    name = config.get("default_connection_name") or os.environ.get("SNOWFLAKE_CONNECTION", "snowconn")
     return config["connections"][name]
 
 
