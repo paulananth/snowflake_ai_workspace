@@ -64,7 +64,7 @@ def load_snowflake_conn() -> snowflake.connector.SnowflakeConnection:
         cfg = tomllib.load(f)["connections"]["myfirstsnow"]
     return snowflake.connector.connect(
         account=cfg["account"], user=cfg["user"], password=cfg["password"],
-        role=cfg.get("role", "ACCOUNTADMIN"), warehouse="cortex_analyst_wh",
+        role=cfg.get("role", "ACCOUNTADMIN"), warehouse=cfg.get("warehouse", "cortex_analyst_wh"),
     )
 
 

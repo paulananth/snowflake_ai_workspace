@@ -83,7 +83,7 @@ def main() -> None:
         user=cfg["user"],
         password=cfg["password"],
         role=cfg.get("role", "ACCOUNTADMIN"),
-        warehouse="cortex_analyst_wh",
+        warehouse=cfg.get("warehouse", "cortex_analyst_wh"),
     )
 
     account = cfg["account"].lower()

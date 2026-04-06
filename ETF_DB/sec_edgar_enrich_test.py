@@ -255,7 +255,7 @@ def load_snowflake_tickers(tickers: list[str]) -> set[str]:
         cfg = tomllib.load(f)["connections"]["myfirstsnow"]
     conn = snowflake.connector.connect(
         account=cfg["account"], user=cfg["user"], password=cfg["password"],
-        role=cfg.get("role", "ACCOUNTADMIN"), warehouse="cortex_analyst_wh",
+        role=cfg.get("role", "ACCOUNTADMIN"), warehouse=cfg.get("warehouse", "cortex_analyst_wh"),
     )
     ticker_list = ", ".join(f"'{t}'" for t in tickers)
     cur = conn.cursor()
