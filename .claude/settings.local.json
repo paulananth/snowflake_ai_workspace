@@ -25,7 +25,29 @@
       "Bash(powershell -Command \"Get-ChildItem ''C:\\\\Users\\\\paula\\\\.local\\\\bin'' -ErrorAction SilentlyContinue | Select-Object Name\")",
       "Bash(powershell -Command \"& ''C:\\\\Users\\\\paula\\\\.local\\\\bin\\\\uv.exe'' python list\")",
       "Bash(powershell -Command \"Get-Content ''C:\\\\Users\\\\paula\\\\.snowflake\\\\config.toml''\")",
-      "Bash(powershell -Command \"Set-Location ''C:\\\\work\\\\projects\\\\snowflake_ai_workspace''; & ''C:\\\\Users\\\\paula\\\\.local\\\\bin\\\\uv.exe'' run ETF_DB/analyze_etf.py\")"
+      "Bash(powershell -Command \"Set-Location ''C:\\\\work\\\\projects\\\\snowflake_ai_workspace''; & ''C:\\\\Users\\\\paula\\\\.local\\\\bin\\\\uv.exe'' run ETF_DB/analyze_etf.py\")",
+      "Bash(powershell -Command \"& ''C:\\\\Prog\\\\SnowCLI\\\\snow.exe'' sql -q \"\"SELECT MIN\\(AS_OF_DATE\\), MAX\\(AS_OF_DATE\\), COUNT\\(DISTINCT AS_OF_DATE\\) AS date_count, COUNT\\(DISTINCT COMPOSITE_TICKER\\) AS etf_count, COUNT\\(DISTINCT CONSTITUENT_TICKER\\) AS stock_count, COUNT\\(*\\) AS total_rows FROM ETF_DB.LOCAL_COPY.CONSTITUENTS;\"\" --connection myfirstsnow\")",
+      "Bash(powershell -Command \"& ''C:\\\\Prog\\\\SnowCLI\\\\snow.exe'' sql -q \"\"SELECT MIN\\(AS_OF_DATE\\), MAX\\(AS_OF_DATE\\), COUNT\\(DISTINCT AS_OF_DATE\\) AS date_count, COUNT\\(DISTINCT COMPOSITE_TICKER\\) AS etf_count, COUNT\\(*\\) AS total_rows FROM ETF_DB.LOCAL_COPY.INDUSTRY;\"\" --connection myfirstsnow\")",
+      "Bash(powershell -Command \"& ''C:\\\\Prog\\\\SnowCLI\\\\snow.exe'' sql -q \"\"SELECT ASSET_CLASS, COUNT\\(DISTINCT COMPOSITE_TICKER\\) AS etf_count FROM ETF_DB.LOCAL_COPY.INDUSTRY GROUP BY ASSET_CLASS ORDER BY etf_count DESC LIMIT 10;\"\" --connection myfirstsnow\")",
+      "Bash(powershell -Command \"& ''C:\\\\Prog\\\\SnowCLI\\\\snow.exe'' sql -q \"\"SELECT ISSUER, COUNT\\(*\\) AS etf_count, SUM\\(AUM\\) AS total_aum FROM ETF_DB.LOCAL_COPY.INDUSTRY GROUP BY ISSUER ORDER BY total_aum DESC NULLS LAST LIMIT 10;\"\" --connection myfirstsnow\")",
+      "Bash(powershell -Command \"& ''C:\\\\Prog\\\\SnowCLI\\\\snow.exe'' sql -q \"\"SELECT ASSET_CLASS, COUNT\\(*\\) AS cnt, AVG\\(WEIGHT\\) AS avg_weight, MAX\\(WEIGHT\\) AS max_weight FROM ETF_DB.LOCAL_COPY.CONSTITUENTS WHERE AS_OF_DATE = ''2025-04-02'' GROUP BY ASSET_CLASS ORDER BY cnt DESC LIMIT 15;\"\" --connection myfirstsnow\")",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(powershell -Command \"& ''C:\\\\Prog\\\\SnowCLI\\\\snow.exe'' sql -q \"\"SELECT as_of_date, COUNT\\(DISTINCT composite_ticker\\) AS etf_count, COUNT\\(*\\) AS rows FROM ETF_DB.LOCAL_COPY.CONSTITUENTS GROUP BY 1 ORDER BY 1;\"\" --connection myfirstsnow\")",
+      "Bash(powershell -Command \"& ''C:\\\\Prog\\\\SnowCLI\\\\snow.exe'' sql -q \"\"SELECT as_of_date, COUNT\\(DISTINCT composite_ticker\\) AS etf_count, COUNT\\(*\\) AS total_rows FROM ETF_DB.LOCAL_COPY.CONSTITUENTS GROUP BY 1 ORDER BY 1;\"\" --connection myfirstsnow\")",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(C:/Prog/SnowCLI/snow.exe sql:*)",
+      "Bash(C:/Prog/SnowCLI/snow.exe stage:*)",
+      "Bash(C:/Users/paula/.local/bin/uv.exe run:*)",
+      "Bash(git -C C:/work/projects/snowflake-ai-workspace log --oneline -5)",
+      "Bash(git -C /c/work/projects/snowflake-ai-workspace log --oneline -5)",
+      "Read(//mnt/c/work/**)",
+      "Bash(find /mnt -name etf_eda_app.py)",
+      "Bash(cmd.exe /c \"dir C:\\\\work\\\\projects\\\\snowflake-ai-workspace\\\\ETF_DB\")",
+      "Bash(cmd.exe /c \"dir C:\\\\work\\\\projects\\\\snowflake_ai_workspace\\\\ETF_DB\")",
+      "Read(//d C:/work/projects/**)",
+      "Bash(uv run:*)"
     ]
   }
 }

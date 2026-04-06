@@ -1,0 +1,20 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "etf-eda-app",
+      "runtimeExecutable": "C:\\Users\\paula\\.local\\bin\\uv.exe",
+      "runtimeArgs": [
+        "run",
+        "--with",
+        "streamlit,pandas,plotly,snowflake-connector-python",
+        "streamlit",
+        "run",
+        "ETF_DB/etf_eda_app.py",
+        "--server.port=8501",
+        "--server.headless=true"
+      ],
+      "port": 8501
+    }
+  ]
+}
