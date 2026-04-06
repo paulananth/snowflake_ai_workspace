@@ -18,7 +18,7 @@ Important scope note:
 
 ```mermaid
 flowchart TD
-  User[User (browser)] -->|requests UI| Streamlit[Streamlit apps]
+  User["User (browser)"] -->|requests UI| Streamlit[Streamlit apps]
   Streamlit -->|queries| Snowflake[Snowflake]
   Snowflake -->|tables| Tables[ETF_DB.LOCAL_COPY]
   Streamlit -->|renders charts| UI[Charts and tables]
