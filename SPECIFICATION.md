@@ -1,6 +1,18 @@
 # SEC EDGAR Security & Financial Data Platform — SPECIFICATION.md
 
-**Platform:** Cloud-agnostic (AWS or Azure)  **Architecture:** Medallion (Bronze / Silver / Gold)  **Source:** SEC EDGAR only  **Storage:** Parquet files in S3 or Azure ADLS Gen2
+**Platform:** Cloud-agnostic (AWS or Azure)  **Architecture:** Medallion (Bronze / Silver / Gold)  **Source:** SEC EDGAR only
+
+> **Before you start:** Two Silver/Gold destination paths are supported. Choose one and follow only those sections.
+>
+> | | **Path A — DuckDB (Parquet)** | **Path B — Snowflake** |
+> |---|---|---|
+> | Silver/Gold storage | Parquet files in S3 / Azure Blob | Snowflake tables |
+> | Transform tool | DuckDB (stateless, in-memory) | dbt-snowflake |
+> | Bronze loading | Not needed — DuckDB reads Parquet directly | COPY INTO from external stage |
+> | Query interface | DuckDB CLI / Python `read_parquet()` | Snowflake UI, SnowSQL, any BI tool |
+> | Best for | Minimal dependencies, cost-sensitive | Teams already on Snowflake, need dbt testing/docs |
+>
+> **Bronze is identical in both paths** — always Parquet in S3 / Azure Blob.
 
 ## 1. System Overview
 
@@ -17,33 +29,46 @@ This is a **greenfield** cloud-agnostic platform for ingesting, storing, and ser
 
 ## 2. Architecture Overview
 
+### Path A — DuckDB (Parquet in S3 / Azure Blob)
+
 ```
 SEC EDGAR APIs
      │
-     ▼
-[Python Ingestion Driver]  ← single-node per task, rate-limited (≤8 req/s per task, sequential tasks)
-     │  HTTP → Parquet (pyarrow + s3fs / adlfs)
-     ▼
-Object Storage  ─────────────── single source of truth (no separate database)
-  AWS:   s3://{BUCKET}/{PREFIX}/
-  Azure: abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/{PREFIX}/
-    bronze/   ← append-only Parquet (raw API responses, never modified)
-    silver/   ← Parquet written by DuckDB transform tasks
-    gold/     ← Parquet written by DuckDB transform tasks
+     ▼ HTTP → Parquet (pyarrow + s3fs / adlfs)
+Object Storage
+  bronze/   ← append-only raw Parquet
+  silver/   ← Parquet written by DuckDB transforms
+  gold/     ← Parquet written by DuckDB transforms
      │
-     ▼ (DuckDB as stateless per-task in-memory query engine)
-Each container task:
-  reads input Parquet from S3/Azure → runs SQL transform in RAM → writes output Parquet to S3/Azure
+     ▼ DuckDB (in-memory per container task)
+  reads Parquet from S3/Azure → SQL transform in RAM → writes Parquet to S3/Azure
 ```
 
-**Key design principles:**
-- No cluster, no managed database — DuckDB runs in a single Docker container
-- All state lives in object storage as Parquet — containers are fully ephemeral
-- Bronze is append-only (never updated, full audit trail)
-- Silver uses per-date snapshot Parquet (idempotent: overwrite today's partition on re-run)
-- Gold is rebuilt from Silver on each run (no incremental complexity)
+### Path B — Snowflake
+
+```
+SEC EDGAR APIs
+     │
+     ▼ HTTP → Parquet (pyarrow + s3fs / adlfs)
+Object Storage
+  bronze/   ← append-only raw Parquet  (same as Path A)
+     │
+     ▼ COPY INTO via Snowflake External Stage
+Snowflake
+  {DB}.bronze.*   ← raw tables loaded from S3/Azure stage
+     │
+     ▼ dbt-snowflake (incremental models)
+  {DB}.silver.*   ← parsed, validated, keyed by security_id
+     │
+     ▼ dbt-snowflake (table models)
+  {DB}.gold.*     ← analytics-ready joins + computed ratios
+```
+
+**Shared design principles (both paths):**
+- Bronze is **always Parquet in S3/Azure** — append-only, never modified, full audit trail
 - `security_id` is a deterministic 16-char hex hash — stable across re-runs, no sequences needed
 - Ingest tasks run **sequentially** to stay under SEC's 10 req/s total rate limit
+- Single Docker image handles ingestion on both paths; Silver/Gold compute differs per path
 
 ---
 
@@ -66,6 +91,13 @@ Each container task:
 **Both clouds (local dev):**
 - **Python 3.11+** and **Docker** installed locally
 - **Cloud CLI** (`aws` or `az`) configured — see **Section 6.1.5** (AWS) or **Section 6.2.6** (Azure)
+
+**Path B (Snowflake) — additional prerequisites:**
+- **Snowflake account** (any edition; Enterprise recommended for `MERGE` performance)
+- **Snowflake database** created: `CREATE DATABASE sec_edgar;`
+- **Snowflake Storage Integration** connecting Snowflake to S3 or ADLS Gen2 — see **Section 6.4**
+- **dbt CLI** installed: `pip install dbt-snowflake`
+- **Key-pair authentication** configured on the Snowflake service user — see **Section 6.4**
 
 ---
 
@@ -442,6 +474,114 @@ export AZURE_TENANT_ID=xxx
 
 ---
 
+### 6.4 Path B — Snowflake Authentication & Storage Integration
+
+#### 6.4.1 Key-Pair Authentication (required for non-interactive/service use)
+
+```bash
+# Generate key pair
+openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -out rsa_key.p8 -nocrypt
+openssl rsa -in rsa_key.p8 -pubout -out rsa_key.pub
+
+# Register public key on the Snowflake service user
+snowsql -q "ALTER USER transformer_svc SET RSA_PUBLIC_KEY='$(grep -v 'PUBLIC KEY' rsa_key.pub | tr -d '\n')';"
+```
+
+Store `rsa_key.p8` in **AWS Secrets Manager** or **Azure Key Vault** — never in the repo or Docker image. Inject at runtime as `SNOWFLAKE_PRIVATE_KEY_PATH` env var.
+
+#### 6.4.2 Snowflake Storage Integration (connecting Snowflake to Bronze Parquet)
+
+**AWS:**
+```sql
+-- Run as ACCOUNTADMIN
+CREATE STORAGE INTEGRATION sec_edgar_s3_int
+  TYPE = EXTERNAL_STAGE
+  STORAGE_PROVIDER = 'S3'
+  ENABLED = TRUE
+  STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::{ACCOUNT}:role/snowflake-s3-reader'
+  STORAGE_ALLOWED_LOCATIONS = ('s3://{BUCKET}/{PREFIX}/bronze/');
+
+-- Snowflake gives you an IAM user to trust:
+DESC INTEGRATION sec_edgar_s3_int;
+-- Note STORAGE_AWS_IAM_USER_ARN and STORAGE_AWS_EXTERNAL_ID
+-- Add a trust relationship to the IAM role for that user
+```
+
+**Azure:**
+```sql
+CREATE STORAGE INTEGRATION sec_edgar_adls_int
+  TYPE = EXTERNAL_STAGE
+  STORAGE_PROVIDER = 'AZURE'
+  ENABLED = TRUE
+  AZURE_TENANT_ID = '{TENANT_ID}'
+  STORAGE_ALLOWED_LOCATIONS = ('azure://{ACCOUNT}.blob.core.windows.net/{CONTAINER}/{PREFIX}/bronze/');
+
+DESC INTEGRATION sec_edgar_adls_int;
+-- Note AZURE_CONSENT_URL — open it to grant Snowflake access to the storage account
+```
+
+#### 6.4.3 External Stage (per dataset)
+
+```sql
+-- Run as SYSADMIN
+CREATE DATABASE IF NOT EXISTS sec_edgar;
+CREATE SCHEMA IF NOT EXISTS sec_edgar.bronze;
+CREATE SCHEMA IF NOT EXISTS sec_edgar.silver;
+CREATE SCHEMA IF NOT EXISTS sec_edgar.gold;
+
+-- AWS stage
+CREATE STAGE sec_edgar.bronze.s3_stage
+  STORAGE_INTEGRATION = sec_edgar_s3_int
+  URL = 's3://{BUCKET}/{PREFIX}/bronze/'
+  FILE_FORMAT = (TYPE = PARQUET);
+
+-- Azure stage
+CREATE STAGE sec_edgar.bronze.adls_stage
+  STORAGE_INTEGRATION = sec_edgar_adls_int
+  URL = 'azure://{ACCOUNT}.blob.core.windows.net/{CONTAINER}/{PREFIX}/bronze/'
+  FILE_FORMAT = (TYPE = PARQUET);
+```
+
+#### 6.4.4 Snowflake Role & Warehouse
+
+```sql
+-- Run as USERADMIN / SYSADMIN
+CREATE ROLE transformer_role;
+CREATE WAREHOUSE transform_wh
+  WAREHOUSE_SIZE = 'X-SMALL'   -- sufficient for 8,000 companies
+  AUTO_SUSPEND = 60
+  AUTO_RESUME = TRUE;
+
+GRANT USAGE ON WAREHOUSE transform_wh     TO ROLE transformer_role;
+GRANT ALL    ON DATABASE  sec_edgar       TO ROLE transformer_role;
+GRANT ALL    ON ALL SCHEMAS IN DATABASE sec_edgar TO ROLE transformer_role;
+GRANT USAGE  ON INTEGRATION sec_edgar_s3_int  TO ROLE transformer_role;  -- or adls_int
+
+CREATE USER transformer_svc DEFAULT_ROLE = transformer_role;
+GRANT ROLE transformer_role TO USER transformer_svc;
+```
+
+#### 6.4.5 dbt Profile
+
+```yaml
+# ~/.dbt/profiles.yml
+sec_edgar:
+  target: prod
+  outputs:
+    prod:
+      type: snowflake
+      account:          "{{ env_var('SNOWFLAKE_ACCOUNT') }}"       # e.g. orgname-accountname
+      user:             "{{ env_var('SNOWFLAKE_USER') }}"
+      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH') }}"
+      role:             transformer_role
+      warehouse:        transform_wh
+      database:         sec_edgar
+      schema:           silver
+      threads:          4
+```
+
+---
+
 ## 7. Object Storage Layout (All Three Layers)
 
 All Bronze, Silver, and Gold data lives in object storage as Parquet. There is no separate database. Every task reads and writes exclusively to `{STORAGE_ROOT}`.
@@ -549,7 +689,12 @@ One row per CIK per daily ingestion. Full XBRL facts payload as a JSON string (2
 
 ---
 
-## 9. Silver Layer — Parquet Schema
+## 9. Silver Layer
+
+> **Path A (DuckDB):** Silver is Parquet files in S3/Azure Blob. Schema defined by PyArrow output.
+> **Path B (Snowflake):** Silver is Snowflake tables in `sec_edgar.silver.*`. Schema defined by DDL below.
+
+### Path A — Parquet Schema (DuckDB)
 
 Silver Parquet files are written by DuckDB transform scripts. Re-running a day's transform overwrites that day's `snapshot_date=` partition (idempotent).
 
@@ -645,34 +790,263 @@ left(sha256(lpad(cast(cik as varchar), 10, '0') || '|' || upper(coalesce(ticker_
 | `split_ratio_denominator` | `int32` | |
 | `description` | `string` | |
 
+### Path B — Snowflake DDL (`sec_edgar.silver.*`)
+
+Run once in Snowflake before the first pipeline execution.
+
+```sql
+-- silver.dim_security
+CREATE TABLE IF NOT EXISTS sec_edgar.silver.dim_security (
+  security_id            VARCHAR(16)   NOT NULL PRIMARY KEY,
+  cik                    NUMBER(10)    NOT NULL,
+  ticker                 VARCHAR(20)   NOT NULL,
+  ticker_class           VARCHAR(5),
+  company_name           VARCHAR(500),
+  exchange               VARCHAR(50),
+  sic                    VARCHAR(10),
+  sic_description        VARCHAR(200),
+  entity_type            VARCHAR(100),
+  state_of_incorporation VARCHAR(5),
+  fiscal_year_end        VARCHAR(4),
+  category               VARCHAR(100),
+  active_flag            BOOLEAN       NOT NULL DEFAULT TRUE,
+  inactive_reason        VARCHAR(100),
+  first_seen_date        DATE,
+  last_seen_date         DATE,
+  created_at             TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+  updated_at             TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- silver.filings_index
+CREATE TABLE IF NOT EXISTS sec_edgar.silver.filings_index (
+  security_id      VARCHAR(16)   NOT NULL,
+  cik              NUMBER(10)    NOT NULL,
+  accession_number VARCHAR(25)   NOT NULL,
+  form_type        VARCHAR(20)   NOT NULL,
+  filed_date       DATE          NOT NULL,
+  period_of_report DATE,
+  filing_url       VARCHAR(500),
+  primary_document VARCHAR(200),
+  is_xbrl          BOOLEAN,
+  items            VARCHAR(100),
+  ingested_at      TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+  PRIMARY KEY (security_id, accession_number)
+);
+
+-- silver.financial_facts
+CREATE TABLE IF NOT EXISTS sec_edgar.silver.financial_facts (
+  security_id          VARCHAR(16)   NOT NULL,
+  cik                  NUMBER(10)    NOT NULL,
+  period_end           DATE          NOT NULL,
+  period_start         DATE,
+  form_type            VARCHAR(20)   NOT NULL,
+  filed_date           DATE          NOT NULL,
+  fiscal_year          NUMBER(4),
+  fiscal_period        VARCHAR(5),
+  taxonomy             VARCHAR(20)   NOT NULL,
+  revenues             NUMBER(22,2),
+  net_income           NUMBER(22,2),
+  operating_income     NUMBER(22,2),
+  total_assets         NUMBER(22,2),
+  total_liabilities    NUMBER(22,2),
+  stockholders_equity  NUMBER(22,2),
+  long_term_debt       NUMBER(22,2),
+  cash_and_equivalents NUMBER(22,2),
+  shares_outstanding   NUMBER(20),
+  operating_cash_flow  NUMBER(22,2),
+  eps_basic            NUMBER(14,4),
+  eps_diluted          NUMBER(14,4),
+  ingested_at          TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP(),
+  PRIMARY KEY (security_id, period_end, form_type)
+);
+
+-- silver.corporate_actions
+CREATE TABLE IF NOT EXISTS sec_edgar.silver.corporate_actions (
+  security_id              VARCHAR(16)   NOT NULL,
+  cik                      NUMBER(10)    NOT NULL,
+  event_type               VARCHAR(50)   NOT NULL,
+  event_date               DATE          NOT NULL,
+  effective_date           DATE,
+  accession_number         VARCHAR(25),
+  form_type                VARCHAR(20),
+  filed_date               DATE,
+  counterparty_cik         NUMBER(10),
+  counterparty_name        VARCHAR(500),
+  split_ratio_numerator    NUMBER(5),
+  split_ratio_denominator  NUMBER(5),
+  description              VARCHAR(1000),
+  ingested_at              TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP()
+);
+```
+
+**`security_id` in Snowflake SQL:**
+```sql
+LEFT(SHA2(LPAD(CAST(cik AS VARCHAR), 10, '0') || '|' || UPPER(COALESCE(ticker_class, 'PRIMARY')), 256), 16)
+```
+
 ---
 
-## 10. Gold Layer — Parquet Schema
+## 10. Gold Layer
+
+### Path A — Parquet Schema (DuckDB)
 
 Gold Parquet files are rebuilt from Silver on every run. No incremental logic.
 
-### 9.1 `gold/financial_statements_annual/refreshed_date=*/data.parquet`
+#### 10.1 `gold/financial_statements_annual/refreshed_date=*/data.parquet`
 
 Columns: `security_id`, `cik`, `ticker`, `company_name`, `exchange`, `fiscal_year`, `period_end`, `filed_date`, `taxonomy`, `revenues`, `net_income`, `operating_income`, `total_assets`, `total_liabilities`, `stockholders_equity`, `long_term_debt`, `cash_and_equivalents`, `operating_cash_flow`, `eps_basic`, `eps_diluted`, plus derived ratios:
 - `net_margin` = `net_income / revenues`
 - `return_on_equity` = `net_income / stockholders_equity`
 - `debt_to_equity` = `long_term_debt / stockholders_equity`
 
-### 9.2 `gold/financial_statements_quarterly/refreshed_date=*/data.parquet`
+#### 10.2 `gold/financial_statements_quarterly/refreshed_date=*/data.parquet`
 
 Same as annual plus `fiscal_period` (`'Q1'`–`'Q4'`). Most recent 8 quarters.
 
-### 9.3 `gold/company_profile/refreshed_date=*/data.parquet`
+#### 10.3 `gold/company_profile/refreshed_date=*/data.parquet`
 
 One row per security. Columns: `security_id`, `cik`, `ticker`, `company_name`, `exchange`, `sic`, `sic_description`, `state_of_incorporation`, `fiscal_year_end`, `active_flag`, `inactive_reason`, `latest_10k_date`, `latest_10q_date`, `latest_revenues`, `latest_total_assets`, `latest_shares_outstanding`, `latest_eps_diluted`.
 
-### 9.4 `gold/filing_catalog/refreshed_date=*/data.parquet`
+#### 10.4 `gold/filing_catalog/refreshed_date=*/data.parquet`
 
 All indexed filings. Columns: `security_id`, `cik`, `ticker`, `company_name`, `accession_number`, `form_type`, `filed_date`, `period_of_report`, `filing_url`, `primary_document`.
 
-### 9.5 `gold/corporate_events/refreshed_date=*/data.parquet`
+#### 10.5 `gold/corporate_events/refreshed_date=*/data.parquet`
 
 Corporate events enriched with ticker and company name. Columns: `security_id`, `cik`, `ticker`, `company_name`, `event_type`, `event_date`, `effective_date`, `form_type`, `filed_date`, `description`.
+
+---
+
+### Path B — Snowflake DDL
+
+Run `scripts/setup/snowflake/03_create_gold_tables.sql`. Gold tables are fully rebuilt by dbt `table` models on each run.
+
+#### 10.6 `gold.financial_statements_annual`
+
+```sql
+CREATE TABLE IF NOT EXISTS sec_edgar.gold.financial_statements_annual (
+  security_id          VARCHAR(16),
+  cik                  NUMBER(10),
+  ticker               VARCHAR(20),
+  company_name         VARCHAR(500),
+  exchange             VARCHAR(50),
+  fiscal_year          NUMBER(4),
+  period_end           DATE,
+  filed_date           DATE,
+  taxonomy             VARCHAR(20),
+  revenues             NUMBER(22,2),
+  net_income           NUMBER(22,2),
+  operating_income     NUMBER(22,2),
+  total_assets         NUMBER(22,2),
+  total_liabilities    NUMBER(22,2),
+  stockholders_equity  NUMBER(22,2),
+  long_term_debt       NUMBER(22,2),
+  cash_and_equivalents NUMBER(22,2),
+  operating_cash_flow  NUMBER(22,2),
+  eps_basic            NUMBER(14,4),
+  eps_diluted          NUMBER(14,4),
+  -- Derived ratios
+  net_margin           NUMBER(10,6),
+  return_on_equity     NUMBER(10,6),
+  debt_to_equity       NUMBER(10,6),
+  refreshed_at         TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY (ticker, fiscal_year);
+```
+
+#### 10.7 `gold.financial_statements_quarterly`
+
+```sql
+CREATE TABLE IF NOT EXISTS sec_edgar.gold.financial_statements_quarterly (
+  security_id          VARCHAR(16),
+  cik                  NUMBER(10),
+  ticker               VARCHAR(20),
+  company_name         VARCHAR(500),
+  exchange             VARCHAR(50),
+  fiscal_year          NUMBER(4),
+  fiscal_period        VARCHAR(5),
+  period_end           DATE,
+  filed_date           DATE,
+  taxonomy             VARCHAR(20),
+  revenues             NUMBER(22,2),
+  net_income           NUMBER(22,2),
+  operating_income     NUMBER(22,2),
+  total_assets         NUMBER(22,2),
+  total_liabilities    NUMBER(22,2),
+  stockholders_equity  NUMBER(22,2),
+  long_term_debt       NUMBER(22,2),
+  cash_and_equivalents NUMBER(22,2),
+  operating_cash_flow  NUMBER(22,2),
+  eps_basic            NUMBER(14,4),
+  eps_diluted          NUMBER(14,4),
+  refreshed_at         TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY (ticker, period_end);
+```
+
+#### 10.8 `gold.company_profile`
+
+```sql
+CREATE TABLE IF NOT EXISTS sec_edgar.gold.company_profile (
+  security_id               VARCHAR(16),
+  cik                       NUMBER(10),
+  ticker                    VARCHAR(20),
+  company_name              VARCHAR(500),
+  exchange                  VARCHAR(50),
+  sic                       VARCHAR(10),
+  sic_description           VARCHAR(200),
+  state_of_incorporation    VARCHAR(5),
+  fiscal_year_end           VARCHAR(4),
+  active_flag               BOOLEAN,
+  inactive_reason           VARCHAR(50),
+  latest_10k_date           DATE,
+  latest_10q_date           DATE,
+  latest_revenues           NUMBER(22,2),
+  latest_total_assets       NUMBER(22,2),
+  latest_shares_outstanding NUMBER(20),
+  latest_eps_diluted        NUMBER(14,4),
+  refreshed_at              TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY (ticker);
+```
+
+#### 10.9 `gold.filing_catalog`
+
+```sql
+CREATE TABLE IF NOT EXISTS sec_edgar.gold.filing_catalog (
+  security_id      VARCHAR(16),
+  cik              NUMBER(10),
+  ticker           VARCHAR(20),
+  company_name     VARCHAR(500),
+  accession_number VARCHAR(25),
+  form_type        VARCHAR(20),
+  filed_date       DATE,
+  period_of_report DATE,
+  filing_url       VARCHAR(500),
+  primary_document VARCHAR(200),
+  refreshed_at     TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY (ticker, filed_date);
+```
+
+#### 10.10 `gold.corporate_events`
+
+```sql
+CREATE TABLE IF NOT EXISTS sec_edgar.gold.corporate_events (
+  security_id    VARCHAR(16),
+  cik            NUMBER(10),
+  ticker         VARCHAR(20),
+  company_name   VARCHAR(500),
+  event_type     VARCHAR(50),
+  event_date     DATE,
+  effective_date DATE,
+  form_type      VARCHAR(20),
+  filed_date     DATE,
+  description    VARCHAR(1000),
+  refreshed_at   TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY (ticker, event_date);
+```
 
 ---
 
@@ -1179,13 +1553,220 @@ conn.execute(f"""
 """)
 ```
 
+### 11.7 Path B — `scripts/snowflake/load_bronze_to_snowflake.py`
+
+Loads today's bronze Parquet batches from the External Stage into Snowflake bronze tables. Runs after all three ingest scripts. Uses `COPY INTO` (idempotent — skips already-loaded files via Snowflake's load history).
+
+```python
+# scripts/snowflake/load_bronze_to_snowflake.py
+import snowflake.connector, os
+from config.settings import INGEST_DATE
+
+SNOWFLAKE_ACCOUNT   = os.environ["SNOWFLAKE_ACCOUNT"]
+SNOWFLAKE_USER      = os.environ["SNOWFLAKE_USER"]
+SNOWFLAKE_DATABASE  = os.environ.get("SNOWFLAKE_DATABASE", "sec_edgar")
+SNOWFLAKE_WAREHOUSE = os.environ.get("SNOWFLAKE_WAREHOUSE", "sec_edgar_wh")
+SNOWFLAKE_ROLE      = os.environ.get("SNOWFLAKE_ROLE", "sec_edgar_loader")
+SNOWFLAKE_KEY_PATH  = os.environ["SNOWFLAKE_PRIVATE_KEY_PATH"]  # injected from Secrets Manager / Key Vault
+
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
+with open(SNOWFLAKE_KEY_PATH, "rb") as f:
+    private_key = load_pem_private_key(f.read(), password=None)
+
+conn = snowflake.connector.connect(
+    account=SNOWFLAKE_ACCOUNT,
+    user=SNOWFLAKE_USER,
+    private_key=private_key,
+    database=SNOWFLAKE_DATABASE,
+    warehouse=SNOWFLAKE_WAREHOUSE,
+    role=SNOWFLAKE_ROLE,
+)
+cur = conn.cursor()
+
+# COPY INTO is idempotent — Snowflake tracks loaded files in load history
+for dataset, table in [
+    (f"company_tickers_exchange/ingestion_date={INGEST_DATE}/", "bronze.company_tickers_exchange_raw"),
+    (f"submissions/ingestion_date={INGEST_DATE}/",              "bronze.submissions_raw"),
+    (f"companyfacts/ingestion_date={INGEST_DATE}/",             "bronze.companyfacts_raw"),
+]:
+    cur.execute(f"""
+        COPY INTO {SNOWFLAKE_DATABASE}.{table}
+        FROM @{SNOWFLAKE_DATABASE}.public.sec_edgar_stage/{dataset}
+        FILE_FORMAT = (TYPE = PARQUET)
+        MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+        ON_ERROR = CONTINUE
+        PURGE = FALSE
+    """)
+    rows = cur.fetchone()[0]
+    print(f"Loaded {rows} rows into {table}")
+
+conn.close()
+```
+
+**Requirements:** Add `snowflake-connector-python>=3.5` and `cryptography>=41.0` to `requirements.txt` for Path B.
+
+### 11.8 Path B — dbt Models (Silver + Gold)
+
+dbt handles all Silver and Gold transforms in Snowflake. Models live under `dbt/models/`.
+
+**`dbt/dbt_project.yml`:**
+```yaml
+name: sec_edgar
+version: '1.0.0'
+profile: sec_edgar
+
+models:
+  sec_edgar:
+    silver:
+      +schema: silver
+      +materialized: incremental
+    gold:
+      +schema: gold
+      +materialized: table
+```
+
+**`dbt/models/silver/dim_security.sql`** (incremental — upsert on `security_id`):
+```sql
+{{
+  config(
+    materialized = 'incremental',
+    unique_key    = 'security_id',
+    merge_update_columns = ['company_name', 'exchange', 'last_seen_date', 'updated_at']
+  )
+}}
+
+SELECT
+  LEFT(SHA2(LPAD(CAST(cik AS VARCHAR), 10, '0') || '|' || 'PRIMARY', 256), 16) AS security_id,
+  cik,
+  ticker,
+  NULL::VARCHAR(5)    AS ticker_class,
+  company_name,
+  exchange,
+  TRUE                AS active_flag,
+  ingestion_date      AS first_seen_date,
+  ingestion_date      AS last_seen_date,
+  CURRENT_TIMESTAMP() AS created_at,
+  CURRENT_TIMESTAMP() AS updated_at
+FROM {{ source('bronze', 'company_tickers_exchange_raw') }}
+WHERE exchange IN ('NYSE', 'Nasdaq')
+{% if is_incremental() %}
+  AND ingestion_date = '{{ var("ingest_date") }}'
+{% endif %}
+```
+
+**`dbt/models/silver/financial_facts.sql`** (incremental — upsert on `security_id + period_end + form_type`):
+```sql
+{{
+  config(
+    materialized = 'incremental',
+    unique_key    = ['security_id', 'period_end', 'form_type'],
+    merge_update_columns = ['revenues', 'net_income', 'operating_income', 'total_assets',
+                             'total_liabilities', 'stockholders_equity', 'filed_date', 'ingested_at']
+  )
+}}
+
+-- Parse XBRL facts from companyfacts_raw.facts_json
+-- Uses Snowflake PARSE_JSON + lateral flatten to unnest us-gaap concept arrays
+WITH raw AS (
+  SELECT cik, ingestion_date,
+         PARSE_JSON(facts_json) AS facts
+  FROM {{ source('bronze', 'companyfacts_raw') }}
+  {% if is_incremental() %}
+  WHERE ingestion_date = '{{ var("ingest_date") }}'
+  {% endif %}
+),
+revenues AS (
+  SELECT cik,
+         f.value:start::DATE   AS period_start,
+         f.value:end::DATE     AS period_end,
+         f.value:filed::DATE   AS filed_date,
+         f.value:form::VARCHAR AS form_type,
+         f.value:fp::VARCHAR   AS fiscal_period,
+         f.value:val::NUMBER(22,2) AS revenues
+  FROM raw,
+  LATERAL FLATTEN(input =>
+    COALESCE(
+      facts['us-gaap']['Revenues']['units']['USD'],
+      facts['us-gaap']['RevenueFromContractWithCustomerExcludingAssessedTax']['units']['USD']
+    )
+  ) f
+  WHERE DATEDIFF('day', f.value:start::DATE, f.value:end::DATE) BETWEEN 355 AND 375
+    AND f.value:form IN ('10-K', '10-K/A')
+)
+-- Similar CTEs for net_income, total_assets, etc.
+-- Final SELECT joins all CTEs on (cik, period_end, form_type)
+-- keeping latest filed_date per (cik, period_end, form_type) for amendment handling
+SELECT
+  ds.security_id,
+  r.cik,
+  r.period_end,
+  r.filed_date,
+  r.form_type,
+  'us-gaap'        AS taxonomy,
+  r.revenues,
+  -- other financial columns follow the same pattern
+  CURRENT_TIMESTAMP() AS ingested_at
+FROM revenues r
+JOIN {{ ref('dim_security') }} ds ON r.cik = ds.cik
+QUALIFY ROW_NUMBER() OVER (PARTITION BY r.cik, r.period_end, r.form_type
+                           ORDER BY r.filed_date DESC) = 1
+```
+
+**`dbt/models/gold/financial_statements_annual.sql`** (`table` — fully rebuilt each run):
+```sql
+{{ config(materialized='table') }}
+
+SELECT
+  s.security_id,
+  s.cik,
+  s.ticker,
+  s.company_name,
+  s.exchange,
+  f.fiscal_year,
+  f.period_end,
+  f.filed_date,
+  f.taxonomy,
+  f.revenues,
+  f.net_income,
+  f.operating_income,
+  f.total_assets,
+  f.total_liabilities,
+  f.stockholders_equity,
+  f.long_term_debt,
+  f.cash_and_equivalents,
+  f.operating_cash_flow,
+  f.eps_basic,
+  f.eps_diluted,
+  DIV0(f.net_income, f.revenues)            AS net_margin,
+  DIV0(f.net_income, f.stockholders_equity) AS return_on_equity,
+  DIV0(f.long_term_debt, f.stockholders_equity) AS debt_to_equity,
+  CURRENT_TIMESTAMP()                       AS refreshed_at
+FROM {{ ref('financial_facts') }} f
+JOIN {{ ref('dim_security') }} s ON f.security_id = s.security_id
+WHERE f.form_type IN ('10-K', '10-K/A')
+```
+
+**Running dbt:**
+```bash
+# Full run (initial load or full refresh)
+dbt run --vars '{"ingest_date": "2024-01-25"}'
+
+# Incremental update for today
+dbt run --vars '{"ingest_date": "2024-01-25"}' --select silver.*
+dbt run --select gold.*
+
+# Run tests
+dbt test
+```
+
 ---
 
 ## 13. Orchestration
 
 All three environments (local, AWS, Azure) run the **same Docker container** with different `CMD` overrides per task. Credentials are injected via environment variables; no secrets are baked into the image.
 
-**Pipeline execution order — tasks run sequentially:**
+### Path A — Pipeline execution order (DuckDB / Parquet)
+
 ```
 [ingest_tickers]          ← Stage 1: 1 HTTP call, writes data.parquet
          │
@@ -1209,6 +1790,38 @@ All three environments (local, AWS, Azure) run the **same Docker container** wit
 ```
 
 **Rule:** All bronze tasks must complete before any silver task starts. The `bronze_gate` task enforces this.
+
+### Path B — Pipeline execution order (Snowflake + dbt)
+
+```
+[ingest_tickers]          ← Stage 1: same as Path A
+         │
+         ▼
+[ingest_submissions]      ← Stage 2a: same as Path A (sequential)
+         │
+         ▼
+[ingest_companyfacts]     ← Stage 2b: same as Path A (sequential)
+         │
+         ▼
+[bronze_gate]             ← asserts Parquet file count > 0 for all 3 bronze datasets
+         │
+         ▼
+[snowflake_copy_into]     ← COPY INTO all bronze Parquet batches → Snowflake bronze tables
+         │                   (scripts/snowflake/load_bronze_to_snowflake.py — Section 11.7)
+         ▼
+[dbt_run_silver]          ← dbt run --select silver.* --vars '{"ingest_date": "..."}'
+         │                   Incremental MERGE into dim_security, filings_index, financial_facts
+         ▼
+[dbt_test_silver]         ← dbt test --select silver.* (not_null, unique key assertions)
+         │
+         ▼
+[dbt_run_gold]            ← dbt run --select gold.* (full table rebuild)
+         │
+         ▼
+[dbt_test_gold]           ← dbt test --select gold.*
+```
+
+**Rule:** Same gate principle applies — `bronze_gate` must pass before `snowflake_copy_into` starts.
 
 ### 12.1 Docker Container (all environments)
 
@@ -1317,36 +1930,61 @@ Files to create: `workflows/step_functions_definition.json`, `workflows/ecs_task
 
 ### 12.4 Option C — Local / Dev (`pipeline.py`)
 
+**Path A (`pipeline.py`):**
 ```python
-# pipeline.py — sequential local runner
-import subprocess, concurrent.futures
+# pipeline.py — Path A sequential local runner (DuckDB / Parquet)
+import subprocess
 from config.settings import INGEST_DATE
 
 def run(args): subprocess.run(["python"] + args, check=True)
 
 # Stage 1
 run(["scripts/ingest/01_ingest_tickers_exchange.py", "--date", INGEST_DATE])
-# Stage 2 — sequential (not parallel, to respect SEC rate limit)
+# Stage 2 — sequential (NOT parallel — respect SEC rate limit)
 run(["scripts/ingest/02_ingest_submissions.py",  "--date", INGEST_DATE])
 run(["scripts/ingest/03_ingest_companyfacts.py", "--date", INGEST_DATE])
 # Bronze gate
 run(["scripts/ingest/bronze_gate.py"])
-# Silver
+# Silver — DuckDB transforms
 run(["scripts/bronze_to_silver/01_silver_dim_security.py"])
 run(["scripts/bronze_to_silver/02_silver_filings_and_facts.py"])
-# Gold
+# Gold — DuckDB transforms
 run(["scripts/silver_to_gold/01_build_gold.py"])
+```
+
+**Path B (`pipeline_snowflake.py`):**
+```python
+# pipeline_snowflake.py — Path B sequential local runner (Snowflake + dbt)
+import subprocess
+from config.settings import INGEST_DATE
+
+def run(args): subprocess.run(["python"] + args, check=True)
+def dbt(args): subprocess.run(["dbt"] + args, cwd="dbt", check=True)
+
+# Stage 1-3: ingest is identical to Path A
+run(["scripts/ingest/01_ingest_tickers_exchange.py", "--date", INGEST_DATE])
+run(["scripts/ingest/02_ingest_submissions.py",  "--date", INGEST_DATE])
+run(["scripts/ingest/03_ingest_companyfacts.py", "--date", INGEST_DATE])
+run(["scripts/ingest/bronze_gate.py"])
+# Stage 4: load bronze Parquet → Snowflake
+run(["scripts/snowflake/load_bronze_to_snowflake.py"])
+# Stage 5: dbt silver + gold
+dbt(["run", "--select", "silver.*", "--vars", f'{{"ingest_date": "{INGEST_DATE}"}}'])
+dbt(["test", "--select", "silver.*"])
+dbt(["run", "--select", "gold.*"])
+dbt(["test", "--select", "gold.*"])
 ```
 
 ---
 
 ## 14. Project File Layout
 
+**Path A (DuckDB):**
 ```
 sec_edgar_platform/
 ├── Dockerfile                              ← single image for ADF Batch, ECS Fargate, and local
 ├── requirements.txt                        ← pyarrow, s3fs, adlfs, azure-identity, duckdb, requests
-├── pipeline.py                             ← local/dev sequential runner (Option C)
+├── pipeline.py                             ← Path A: local/dev sequential runner
 ├── config/
 │   └── settings.py                         ← CLOUD_PROVIDER, storage config (all from env vars)
 ├── scripts/
@@ -1377,11 +2015,48 @@ sec_edgar_platform/
     └── test_spot_check.py                  ← DuckDB queries over S3/Azure Parquet for verification
 ```
 
-**No `scripts/setup/` SQL files** — there is no database to initialize. Parquet directories are created automatically by the first write.
+**Path B additions (Snowflake + dbt):**
+```
+sec_edgar_platform/
+├── pipeline_snowflake.py                   ← Path B: local/dev runner (replaces pipeline.py)
+├── requirements_snowflake.txt              ← adds: snowflake-connector-python, cryptography, dbt-snowflake
+├── scripts/
+│   ├── snowflake/
+│   │   └── load_bronze_to_snowflake.py    ← COPY INTO bronze Parquet → Snowflake bronze tables
+│   └── setup/
+│       └── snowflake/
+│           ├── 01_create_schemas.sql       ← CREATE DATABASE / SCHEMA / WAREHOUSE / ROLE
+│           ├── 02_create_silver_tables.sql ← Silver DDL (Section 9 Path B)
+│           ├── 03_create_gold_tables.sql   ← Gold DDL (Section 10 Path B)
+│           └── 04_create_stage.sql         ← External Stage + Storage Integration (Section 6.4)
+└── dbt/
+    ├── dbt_project.yml
+    ├── profiles.yml                        ← Snowflake connection (key-pair auth — Section 6.4)
+    ├── sources.yml                         ← declares bronze tables as dbt sources
+    ├── models/
+    │   ├── silver/
+    │   │   ├── dim_security.sql            ← incremental MERGE (Section 11.8)
+    │   │   ├── filings_index.sql           ← incremental MERGE
+    │   │   ├── financial_facts.sql         ← incremental MERGE (Section 11.8)
+    │   │   └── corporate_actions.sql       ← incremental MERGE
+    │   └── gold/
+    │       ├── financial_statements_annual.sql     ← table (Section 11.8)
+    │       ├── financial_statements_quarterly.sql  ← table
+    │       ├── company_profile.sql                 ← table
+    │       ├── filing_catalog.sql                  ← table
+    │       └── corporate_events.sql                ← table
+    └── tests/
+        ├── silver_not_null.yml             ← dbt not_null/unique tests on silver primary keys
+        └── gold_not_null.yml               ← dbt tests on gold
+```
+
+**No `scripts/setup/` SQL files for Path A** — there is no database to initialize. Parquet directories are created automatically by the first write.
 
 ---
 
 ## 15. Verification Steps
+
+### Path A — DuckDB / Parquet
 
 All verification uses DuckDB reading Parquet directly from S3/Azure — no database connection needed.
 
@@ -1474,8 +2149,77 @@ az datafactory pipeline create-run \
 # Expected runtime: ~60–90 min for full initial load of ~8,000 companies
 ```
 
-### Step 8 — Idempotency check
+### Step 8 — Idempotency check (Path A)
 Re-run the pipeline for the same date. Silver/Gold Parquet files are overwritten with identical content (same row counts). Bronze skips files that already exist.
+
+---
+
+### Path B — Snowflake
+
+### Step B-1 — Snowflake connectivity
+```bash
+snowsql -a {SNOWFLAKE_ACCOUNT} -u {SNOWFLAKE_USER} --private-key-path ~/.snowflake/rsa_key.p8
+# Expected: SnowSQL prompt; run: SELECT CURRENT_USER(), CURRENT_ROLE();
+```
+
+### Step B-2 — Bronze tables loaded
+```sql
+SELECT ingestion_date, COUNT(*) AS rows
+FROM sec_edgar.bronze.company_tickers_exchange_raw
+GROUP BY ingestion_date ORDER BY ingestion_date DESC LIMIT 5;
+-- Expected: today's date with 10,000+ rows
+
+SELECT ingestion_date, COUNT(*) AS rows
+FROM sec_edgar.bronze.submissions_raw
+GROUP BY ingestion_date ORDER BY ingestion_date DESC LIMIT 5;
+-- Expected: today's date with 6,000+ rows (NYSE + Nasdaq)
+```
+
+### Step B-3 — External stage accessible
+```sql
+LIST @sec_edgar.public.sec_edgar_stage/bronze/company_tickers_exchange/;
+-- Expected: today's batch Parquet files listed; no error
+```
+
+### Step B-4 — Silver security master (after dbt run)
+```sql
+SELECT COUNT(*) AS total_securities,
+       SUM(CASE WHEN active_flag THEN 1 ELSE 0 END) AS active
+FROM sec_edgar.silver.dim_security;
+-- Expected: ~6,000–8,000 active (NYSE + Nasdaq)
+```
+
+### Step B-5 — Spot check known tickers
+```sql
+SELECT s.ticker, s.company_name, f.period_end, f.revenues, f.net_income
+FROM sec_edgar.silver.dim_security s
+JOIN sec_edgar.silver.financial_facts f ON s.security_id = f.security_id
+WHERE s.ticker IN ('AAPL', 'MSFT', 'TSLA', 'JPM')
+  AND f.form_type = '10-K'
+ORDER BY s.ticker, f.period_end DESC;
+-- Expected: 4+ rows per ticker with positive revenues
+```
+
+### Step B-6 — Gold tables ready
+```sql
+SELECT ticker, fiscal_year, revenues, net_margin, return_on_equity
+FROM sec_edgar.gold.financial_statements_annual
+WHERE ticker IN ('AAPL', 'MSFT')
+ORDER BY ticker, fiscal_year DESC
+LIMIT 10;
+```
+
+### Step B-7 — Full pipeline run (Path B)
+```bash
+# Local
+python pipeline_snowflake.py
+
+# dbt docs (optional — generates HTML lineage graph)
+cd dbt && dbt docs generate && dbt docs serve
+```
+
+### Step B-8 — Idempotency check (Path B)
+Re-run `dbt run` for the same `ingest_date`. Silver rows are upserted (no duplicates — unique key constraint). Gold is fully rebuilt. Row counts should be identical.
 
 ---
 
@@ -1501,12 +2245,29 @@ Re-run the pipeline for the same date. Silver/Gold Parquet files are overwritten
 
 ## 17. How to Start Coding (Post-Review Checklist)
 
-Once you have reviewed this spec and are ready to implement, follow these steps in order. Each step is independently testable.
+> ### ❓ Decision Gate — Choose your Silver/Gold destination before proceeding
+>
+> | Question | Answer |
+> |---|---|
+> | Do you already have a Snowflake account (or budget for one)? | If **yes** → **Path B (Snowflake)**. If **no** → **Path A (DuckDB)**. |
+> | Do you need dbt tests, lineage docs, or BI tool SQL access? | If **yes** → **Path B**. |
+> | Is cost sensitivity or minimal infrastructure your priority? | If **yes** → **Path A**. |
+> | Are you prototyping or running on a laptop? | **Path A** — no external service needed. |
+>
+> **Set your path now.** Write it in `config/settings.py` or your `.env`:
+> ```bash
+> SILVER_GOLD_PATH=duckdb     # Path A — DuckDB writes Parquet to S3/Azure
+> # or
+> SILVER_GOLD_PATH=snowflake  # Path B — COPY INTO + dbt-snowflake
+> ```
+> Then follow only the phases for your chosen path below.
 
-### Phase 0 — Environment Setup (Do Once)
+---
 
-- [ ] **Choose cloud**: set `CLOUD_PROVIDER=aws` or `CLOUD_PROVIDER=azure` as an env var.
-- [ ] **Provision storage** (Section 5): create S3 bucket or ADLS Gen2 storage account + container.
+### Phase 0 — Environment Setup (Do Once — Both Paths)
+
+- [ ] **Choose cloud provider**: set `CLOUD_PROVIDER=aws` or `CLOUD_PROVIDER=azure`.
+- [ ] **Provision storage** (Section 5): create S3 bucket or ADLS Gen2 storage account + container with Hierarchical Namespace enabled.
 - [ ] **Configure credentials and IAM/RBAC** — follow **Section 6** completely before running any script:
   - AWS: create ECS Task Role + Execution Role + Step Functions Role (Section 6.1); locally run `aws configure`
   - Azure: create Managed Identity, assign RBAC roles, configure Batch pool identity (Section 6.2); locally run `az login`
@@ -1515,9 +2276,8 @@ Once you have reviewed this spec and are ready to implement, follow these steps 
   python -m venv .venv && source .venv/bin/activate
   pip install -r requirements.txt
   ```
-- [ ] **No database to set up.** There is no DDL to run. Parquet directories are created automatically.
 
-### Phase 1 — Create the Project Scaffold
+### Phase 1 — Create the Project Scaffold (Both Paths)
 
 ```bash
 mkdir -p config scripts/{ingest,bronze_to_silver,silver_to_gold} workflows tests
@@ -1526,57 +2286,142 @@ touch config/__init__.py config/settings.py
 
 Copy the settings template from **Section 4** into `config/settings.py` and fill in your values.
 
-### Phase 2 — Write and Test the Ingestion Scripts
+### Phase 2 — Write and Test the Ingestion Scripts (Both Paths)
 
-1. **`scripts/ingest/_rate_limiter.py`** — Section 11.0
-2. **`scripts/ingest/_http.py`** — Section 11.0
-3. **`scripts/ingest/_batch_writer.py`** — Section 11.0 (updated with fsspec/s3fs/adlfs)
-4. **`scripts/ingest/01_ingest_tickers_exchange.py`** — Section 11.1
+These scripts are **identical for both paths** — bronze always lands as Parquet in S3/Azure.
+
+1. **`scripts/ingest/_rate_limiter.py`** — Section 12 (11.0)
+2. **`scripts/ingest/_http.py`** — Section 12 (11.0)
+3. **`scripts/ingest/_batch_writer.py`** — Section 12 (11.0) — uses fsspec/s3fs/adlfs
+4. **`scripts/ingest/01_ingest_tickers_exchange.py`** — Section 12 (11.1)
    - Test: `INGEST_DATE=2024-01-25 python scripts/ingest/01_ingest_tickers_exchange.py`
    - Verify: Parquet appears in `{STORAGE_ROOT}/bronze/company_tickers_exchange/ingestion_date=2024-01-25/`
    - Check row count ≈ 10,000–12,000
-5. **`scripts/ingest/02_ingest_submissions.py`** — Section 11.2
-   - Dev test: `--limit 5` flag
-6. **`scripts/ingest/03_ingest_companyfacts.py`** — Section 11.3
-   - Dev test: `--limit 5`; AAPL (CIK 320193) is a good stress test for large payload
-
-### Phase 3 — Write Silver Transforms (DuckDB)
-
-1. **`scripts/bronze_to_silver/01_silver_dim_security.py`** — Section 11.4
-   - The `security_id` hash is the most critical piece — test it with known CIKs first (Section 8.1)
-   - Verify: DuckDB `SELECT COUNT(*) FROM read_parquet('.../silver/dim_security/.../data.parquet')`
-
-2. **`scripts/bronze_to_silver/02_silver_filings_and_facts.py`** — Section 11.5
-   - Start with `filings_index` (simpler JSON parsing), then add `financial_facts`
-   - Key complexity: unnesting parallel arrays from `filings_recent_json` and XBRL concept extraction
-
-### Phase 4 — Write Gold Transforms (DuckDB)
-
-**`scripts/silver_to_gold/01_build_gold.py`** — Section 11.6
-
-Start with `financial_statements_annual` (highest value). Each gold table is a single DuckDB `COPY ... TO` with a `SELECT ... JOIN` of silver Parquet.
-
-### Phase 5 — Wire Up Cloud Orchestration
-
-**Azure:** Create `workflows/adf_pipeline.json` (Section 12.2). Deploy via ADF portal or ARM deployment.
-
-**AWS:** Create `workflows/step_functions_definition.json` and `workflows/ecs_task_definition.json` (Section 12.3). Deploy via `aws cloudformation` or Terraform.
-
-### Phase 6 — Full Verification
-
-Run all verification steps from **Section 14** in order.
+5. **`scripts/ingest/02_ingest_submissions.py`** — Section 12 (11.2) — dev test: `--limit 5`
+6. **`scripts/ingest/03_ingest_companyfacts.py`** — Section 12 (11.3) — dev test: `--limit 5`
+7. **`scripts/ingest/bronze_gate.py`** — asserts all 3 datasets have Parquet files before proceeding
 
 ---
 
-### Implementation Priority (deliver value incrementally)
+### Path A — DuckDB / Parquet (continue here if SILVER_GOLD_PATH=duckdb)
+
+### Phase A-3 — Write Silver Transforms (DuckDB)
+
+1. **`scripts/bronze_to_silver/01_silver_dim_security.py`** — Section 12 (11.4)
+   - The `security_id` SHA-256 hash is the most critical piece — test with known CIKs first (Section 9 Path A)
+   - Verify: `python -c "import duckdb; c=duckdb.connect(); print(c.execute(\"SELECT COUNT(*) FROM read_parquet('.../silver/dim_security/*/*.parquet')\").fetchone())"`
+
+2. **`scripts/bronze_to_silver/02_silver_filings_and_facts.py`** — Section 12 (11.5)
+   - Start with `filings_index` (simpler JSON parsing), then add `financial_facts`
+   - Key complexity: unnesting parallel arrays from `filings_recent_json` and XBRL concept extraction
+
+### Phase A-4 — Write Gold Transforms (DuckDB)
+
+**`scripts/silver_to_gold/01_build_gold.py`** — Section 12 (11.6)
+
+Start with `financial_statements_annual` (highest value). Each gold table is a single DuckDB `COPY ... TO` with a `SELECT ... JOIN` of silver Parquet. Verify with Section 15 Steps 4–6.
+
+### Phase A-5 — Wire Up Cloud Orchestration
+
+**Azure:** Create `workflows/adf_pipeline.json` (Section 13, Option A — ADF). Deploy via ADF portal or ARM.
+
+**AWS:** Create `workflows/step_functions_definition.json` + `workflows/ecs_task_definition.json` (Section 13, Option B — Step Functions). Deploy via `aws cloudformation` or Terraform.
+
+### Phase A-6 — Full Verification (Path A)
+
+Run Steps 1–8 from **Section 15 (Path A)** in order.
+
+---
+
+### Path A — Implementation Priority
 
 | Priority | Deliverable | Sections |
 |---|---|---|
-| 1 (highest) | Bronze tickers + silver `dim_security` | 6, 7.1, 8.1, 11.1–11.4 |
-| 2 | Bronze submissions + silver `filings_index` | 7.2, 8.2, 11.2 |
-| 3 | Bronze companyfacts + silver `financial_facts` | 7.3, 8.3, 11.3, 11.5 |
-| 4 | Gold annual financials | 9.1, 11.6 |
-| 5 | Gold quarterly + company profile + corporate events | 9.2–9.5 |
-| 6 | Cloud orchestration (ADF or Step Functions) | 12 |
+| 1 (highest) | Bronze tickers + silver `dim_security` | 6, 7.1, 9 Path A (9.1), 12 (11.1–11.4) |
+| 2 | Bronze submissions + silver `filings_index` | 7.2, 9 Path A (9.2), 12 (11.2) |
+| 3 | Bronze companyfacts + silver `financial_facts` | 7.3, 9 Path A (9.3), 12 (11.3, 11.5) |
+| 4 | Gold annual financials | 10 Path A (10.1), 12 (11.6) |
+| 5 | All other gold tables | 10 Path A (10.2–10.5) |
+| 6 | Cloud orchestration (ADF or Step Functions) | 13 |
 
-**Start with Priority 1.** You'll have a queryable security master with `security_id` before writing a single financial fact row.
+---
+
+### Path B — Snowflake + dbt (continue here if SILVER_GOLD_PATH=snowflake)
+
+### Phase B-3 — Snowflake Setup (One-Time)
+
+- [ ] **Configure Snowflake auth** — generate RSA key pair, add public key to service user (Section 6.4)
+- [ ] **Create Storage Integration** (Section 6.4) — runs as `ACCOUNTADMIN`; provides Snowflake an IAM role (AWS) or Managed Identity (Azure) to read from the S3/Azure stage
+- [ ] **Install additional Python deps**:
+  ```bash
+  pip install snowflake-connector-python>=3.5 cryptography>=41.0 dbt-snowflake>=1.7
+  ```
+- [ ] **Run Snowflake setup SQL** in order:
+  ```bash
+  snowsql -a {ACCOUNT} -u {USER} -f scripts/setup/snowflake/01_create_schemas.sql
+  snowsql -a {ACCOUNT} -u {USER} -f scripts/setup/snowflake/02_create_silver_tables.sql
+  snowsql -a {ACCOUNT} -u {USER} -f scripts/setup/snowflake/03_create_gold_tables.sql
+  snowsql -a {ACCOUNT} -u {USER} -f scripts/setup/snowflake/04_create_stage.sql
+  ```
+- [ ] **Configure dbt profile** (`dbt/profiles.yml`) — see Section 6.4; set `private_key_path`
+- [ ] **Verify dbt connection**: `cd dbt && dbt debug`
+
+### Phase B-4 — Load Bronze into Snowflake
+
+**`scripts/snowflake/load_bronze_to_snowflake.py`** — Section 12 (11.7)
+
+After each ingest run: `python scripts/snowflake/load_bronze_to_snowflake.py`
+
+Verify Step B-2 in **Section 15 (Path B)** — bronze tables have today's rows.
+
+### Phase B-5 — Write and Run dbt Silver Models
+
+1. Create **`dbt/models/silver/dim_security.sql`** — Section 12 (11.8)
+   - Test first full run: `dbt run --select silver.dim_security --vars '{"ingest_date": "2024-01-25"}'`
+   - Verify: `SELECT COUNT(*) FROM sec_edgar.silver.dim_security;` → 6,000+
+2. Create **`dbt/models/silver/financial_facts.sql`** — Section 12 (11.8)
+   - The XBRL LATERAL FLATTEN pattern is the most complex piece — test with CIK 320193 (Apple)
+3. Create remaining silver models: `filings_index.sql`, `corporate_actions.sql`
+4. Run `dbt test --select silver.*` — fix any not_null / unique failures before proceeding
+
+### Phase B-6 — Write and Run dbt Gold Models
+
+Create all 5 gold models under `dbt/models/gold/` — Section 12 (11.8). Each is a `{{ config(materialized='table') }}` `SELECT ... JOIN` of silver refs.
+
+```bash
+dbt run --select gold.*
+dbt test --select gold.*
+```
+
+Verify with Steps B-5 and B-6 from **Section 15 (Path B)**.
+
+### Phase B-7 — Wire Up Cloud Orchestration (Path B)
+
+Add two extra tasks to the ADF or Step Functions pipeline after `bronze_gate`:
+
+- **`snowflake_copy_into`** — runs `scripts/snowflake/load_bronze_to_snowflake.py`
+- **`dbt_run_silver`** — runs `dbt run --select silver.* --vars ...`
+- **`dbt_test_silver`** — runs `dbt test --select silver.*`
+- **`dbt_run_gold`** — runs `dbt run --select gold.*`
+- **`dbt_test_gold`** — runs `dbt test --select gold.*`
+
+See Section 13 Path B pipeline order diagram for full dependency chain.
+
+### Phase B-8 — Full Verification (Path B)
+
+Run Steps B-1 through B-8 from **Section 15 (Path B)** in order.
+
+---
+
+### Path B — Implementation Priority
+
+| Priority | Deliverable | Sections |
+|---|---|---|
+| 1 (highest) | Snowflake setup + bronze COPY INTO + dbt `dim_security` | 6.4, 9 Path B (9.1), 10 Path B (10.8), 12 (11.7–11.8) |
+| 2 | dbt `filings_index` | 9 Path B (9.2), 12 (11.8) |
+| 3 | dbt `financial_facts` | 9 Path B (9.3), 12 (11.8) |
+| 4 | dbt gold `financial_statements_annual` | 10 Path B (10.6), 12 (11.8) |
+| 5 | All other gold models | 10 Path B (10.7–10.10) |
+| 6 | Cloud orchestration with Snowflake + dbt tasks | 13 |
+
+**Start with Priority 1.** You'll have a queryable Snowflake `dim_security` table with `security_id` before writing a single financial fact row.
