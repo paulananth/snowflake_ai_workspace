@@ -51,21 +51,21 @@ Each container task:
 
 **AWS:**
 1. **S3 bucket** in your target region (e.g. `my-sec-edgar-bucket`)
-2. **IAM role** with `s3:GetObject`, `s3:PutObject`, `s3:ListBucket` on `arn:aws:s3:::my-sec-edgar-bucket/sec-edgar/*`
+2. **IAM roles**: ECS Task Role, ECS Execution Role, Step Functions Role, EventBridge Scheduler Role — see **Section 6.1**
 3. **ECR repository** to store the Docker image
-4. **ECS cluster** (Fargate launch type) + VPC with private subnets and a NAT Gateway (for SEC API access)
-5. **AWS Step Functions** state machine (see Section 12)
+4. **ECS cluster** (Fargate launch type) + VPC with private subnets and a NAT Gateway (for SEC API outbound)
+5. **AWS Step Functions** state machine (see Section 13)
 
 **Azure:**
 1. **Storage account** with **Hierarchical Namespace enabled** (ADLS Gen2) — required for `abfss://` scheme
-2. **User-Assigned Managed Identity** granted `Storage Blob Data Contributor` on the storage account
+2. **User-Assigned Managed Identity** with RBAC roles — see **Section 6.2**
 3. **Azure Container Registry (ACR)** to store the Docker image
 4. **Azure Batch account** with a pool configured for Docker container execution; pool identity = Managed Identity above
-5. **Azure Data Factory** pipeline (see Section 12)
+5. **Azure Data Factory** pipeline (see Section 13)
 
 **Both clouds (local dev):**
 - **Python 3.11+** and **Docker** installed locally
-- **Cloud CLI** (`aws` or `az`) configured with credentials that have write access to the storage bucket/container
+- **Cloud CLI** (`aws` or `az`) configured — see **Section 6.1.5** (AWS) or **Section 6.2.6** (Azure)
 
 ---
 
@@ -85,14 +85,13 @@ CLOUD_PROVIDER = os.environ.get("CLOUD_PROVIDER", "aws")   # "aws" | "azure"
 AWS_BUCKET      = os.environ.get("AWS_BUCKET",          "my-bucket")     # CHANGE THIS
 STORAGE_PREFIX  = os.environ.get("STORAGE_PREFIX",      "sec-edgar")
 AWS_REGION      = os.environ.get("AWS_DEFAULT_REGION",  "us-east-1")     # CHANGE THIS
-# Auth: ECS task IAM role (production) or ~/.aws credentials (local dev) — nothing to set here
+# Auth: see Section 6.1 (ECS task IAM role in production; ~/.aws credentials locally)
 
 # ─── Azure ─────────────────────────────────────────────────────────────────────
 AZURE_ACCOUNT   = os.environ.get("AZURE_STORAGE_ACCOUNT", "myaccount")   # CHANGE THIS
 AZURE_CONTAINER = os.environ.get("AZURE_CONTAINER",       "sec-edgar")   # CHANGE THIS
 # Requires ADLS Gen2 (Hierarchical Namespace enabled on the storage account)
-# Auth: User-Assigned Managed Identity — set AZURE_CLIENT_ID env var on Batch pool
-# Local dev: `az login` (DefaultAzureCredential picks it up automatically)
+# Auth: see Section 6.2 (User-Assigned Managed Identity; AZURE_CLIENT_ID env var on Batch pool)
 
 # ─── Derived storage root ──────────────────────────────────────────────────────
 def _storage_root() -> str:
@@ -162,7 +161,288 @@ az role assignment create \
 
 ---
 
-## 6. Object Storage Layout (All Three Layers)
+## 6. Authentication & Permissions
+
+Authentication follows **zero-secrets-in-code** principles: containers get credentials from the compute identity (ECS task IAM role on AWS, Managed Identity on Azure). No access keys, storage account keys, or service principal secrets are stored in Docker images, config files, or environment variables on production systems.
+
+---
+
+### 6.1 AWS — Identity & Access Model
+
+#### Principal hierarchy
+
+```
+EventBridge Scheduler
+  └─ assumes → Step Functions Execution Role
+                 └─ calls ecs:RunTask → ECS Task
+                              └─ assumes → ECS Task Role  ← Python code runs as this
+```
+
+#### 6.1.1 ECS Task Role (what the container code is)
+
+Attached to the ECS task definition as `taskRoleArn`. Python scripts inside the container inherit it automatically via the EC2 instance metadata endpoint — no env vars needed.
+
+**Trust policy** (`workflows/iam/ecs_task_trust.json`):
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Service": "ecs-tasks.amazonaws.com" },
+    "Action": "sts:AssumeRole"
+  }]
+}
+```
+
+**Permissions policy** (`workflows/iam/ecs_task_role_policy.json`):
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "S3ReadWrite",
+    "Effect": "Allow",
+    "Action": [
+      "s3:GetObject", "s3:PutObject", "s3:DeleteObject",
+      "s3:ListBucket", "s3:GetBucketLocation"
+    ],
+    "Resource": [
+      "arn:aws:s3:::{BUCKET}",
+      "arn:aws:s3:::{BUCKET}/{STORAGE_PREFIX}/*"
+    ]
+  }]
+}
+```
+
+```bash
+aws iam create-role \
+  --role-name sec-edgar-ecs-task-role \
+  --assume-role-policy-document file://workflows/iam/ecs_task_trust.json
+
+aws iam put-role-policy \
+  --role-name sec-edgar-ecs-task-role \
+  --policy-name S3ReadWrite \
+  --policy-document file://workflows/iam/ecs_task_role_policy.json
+```
+
+#### 6.1.2 ECS Task Execution Role (ECS control-plane — pull image + write logs)
+
+Attach the AWS-managed policy; no custom policy needed.
+
+```bash
+aws iam create-role \
+  --role-name sec-edgar-ecs-execution-role \
+  --assume-role-policy-document file://workflows/iam/ecs_task_trust.json
+
+aws iam attach-role-policy \
+  --role-name sec-edgar-ecs-execution-role \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+```
+
+#### 6.1.3 Step Functions State Machine Role
+
+Allows the state machine to submit ECS tasks and pass the task/execution roles.
+
+**Permissions policy** (`workflows/iam/sfn_role_policy.json`):
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "RunECSTask",
+      "Effect": "Allow",
+      "Action": ["ecs:RunTask", "ecs:StopTask", "ecs:DescribeTasks"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "PassTaskRoles",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": [
+        "arn:aws:iam::{ACCOUNT}:role/sec-edgar-ecs-task-role",
+        "arn:aws:iam::{ACCOUNT}:role/sec-edgar-ecs-execution-role"
+      ]
+    },
+    {
+      "Sid": "EventBridgeSync",
+      "Effect": "Allow",
+      "Action": ["events:PutTargets", "events:PutRule", "events:DescribeRule"],
+      "Resource": "arn:aws:events:{REGION}:{ACCOUNT}:rule/StepFunctionsGetEventsForECSTaskRule"
+    }
+  ]
+}
+```
+
+#### 6.1.4 EventBridge Scheduler Role
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": "states:StartExecution",
+    "Resource": "arn:aws:states:{REGION}:{ACCOUNT}:stateMachine:sec-edgar-daily"
+  }]
+}
+```
+
+#### 6.1.5 Local Dev (AWS)
+
+`s3fs.S3FileSystem()` and DuckDB `LOAD httpfs` use the standard boto3 credential chain: env vars → `~/.aws/credentials` → instance profile → ECS task role.
+
+```bash
+# Option A — named profile
+aws configure --profile sec-edgar
+export AWS_PROFILE=sec-edgar
+
+# Option B — environment variables (CI/CD)
+export AWS_ACCESS_KEY_ID=AKIAxxx
+export AWS_SECRET_ACCESS_KEY=xxx
+export AWS_DEFAULT_REGION=us-east-1
+```
+
+---
+
+### 6.2 Azure — Identity & Access Model
+
+#### Principal hierarchy
+
+```
+ADF Pipeline (system-assigned MSI)
+  └─ Linked Service → Azure Batch account
+       └─ Batch Pool (User-Assigned Managed Identity) ← containers run as this
+            RBAC assignments on the pool identity:
+              ├─ Storage Blob Data Contributor  →  ADLS Gen2 storage account
+              └─ AcrPull                        →  Azure Container Registry
+```
+
+#### 6.2.1 Create the User-Assigned Managed Identity
+
+```bash
+az identity create \
+  --name sec-edgar-ingest-identity \
+  --resource-group my-rg \
+  --location eastus
+
+# Save the client ID — required as AZURE_CLIENT_ID env var on the Batch pool
+CLIENT_ID=$(az identity show \
+  --name sec-edgar-ingest-identity --resource-group my-rg \
+  --query clientId --output tsv)
+
+PRINCIPAL_ID=$(az identity show \
+  --name sec-edgar-ingest-identity --resource-group my-rg \
+  --query principalId --output tsv)
+```
+
+#### 6.2.2 RBAC Role Assignments
+
+```bash
+STORAGE_SCOPE="/subscriptions/{SUB}/resourceGroups/{RG}/providers/Microsoft.Storage/storageAccounts/myaccount"
+ACR_SCOPE="/subscriptions/{SUB}/resourceGroups/{RG}/providers/Microsoft.ContainerRegistry/registries/myregistry"
+
+# Read + write Parquet files in ADLS Gen2
+az role assignment create \
+  --role "Storage Blob Data Contributor" \
+  --assignee-object-id $PRINCIPAL_ID \
+  --assignee-principal-type ServicePrincipal \
+  --scope $STORAGE_SCOPE
+
+# Pull Docker image onto Batch pool nodes
+az role assignment create \
+  --role "AcrPull" \
+  --assignee-object-id $PRINCIPAL_ID \
+  --assignee-principal-type ServicePrincipal \
+  --scope $ACR_SCOPE
+```
+
+**Minimum required roles — do not use broader roles:**
+
+| Resource | Role | Justification |
+|---|---|---|
+| ADLS Gen2 storage account | `Storage Blob Data Contributor` | Read + write Parquet; does not grant account management |
+| Azure Container Registry | `AcrPull` | Pull image only; does not allow push or admin |
+| Azure Batch account (ADF linked service) | `Contributor` scoped to Batch account | ADF submits jobs; cannot access storage or other resources |
+
+#### 6.2.3 Assign Identity to Azure Batch Pool
+
+```bash
+IDENTITY_ID="/subscriptions/{SUB}/resourceGroups/{RG}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/sec-edgar-ingest-identity"
+
+az batch pool create \
+  --id sec-edgar-pool \
+  --account-name mybatchaccount \
+  --vm-size Standard_D4s_v3 \
+  --target-dedicated-nodes 2 \
+  --image canonical:0001-com-ubuntu-server-jammy:22_04-lts \
+  --node-agent-sku-id "batch.node.ubuntu 22.04" \
+  --identity $IDENTITY_ID
+```
+
+#### 6.2.4 Container Environment Variable
+
+When multiple managed identities could be present on a node, `DefaultAzureCredential` needs a hint. Set this on the Batch pool's environment settings (not in the Docker image):
+
+```
+AZURE_CLIENT_ID = <client-id from 6.2.1>
+```
+
+`adlfs.AzureBlobFileSystem(credential=DefaultAzureCredential())` and DuckDB `LOAD azure` both pick it up automatically.
+
+#### 6.2.5 ADF System Identity Permissions
+
+ADF connects to Batch and Storage using its own system-assigned managed identity:
+
+```bash
+ADF_PRINCIPAL=$(az datafactory show \
+  --name my-adf --resource-group my-rg \
+  --query identity.principalId --output tsv)
+
+BATCH_SCOPE="/subscriptions/{SUB}/resourceGroups/{RG}/providers/Microsoft.Batch/batchAccounts/mybatchaccount"
+
+az role assignment create --role "Contributor" \
+  --assignee-object-id $ADF_PRINCIPAL \
+  --scope $BATCH_SCOPE
+
+az role assignment create --role "Storage Blob Data Reader" \
+  --assignee-object-id $ADF_PRINCIPAL \
+  --scope $STORAGE_SCOPE
+```
+
+#### 6.2.6 Local Dev (Azure)
+
+`DefaultAzureCredential` automatically picks up `az login`:
+
+```bash
+az login
+az account set --subscription {SUB}
+
+# Verify access
+az storage blob list --container-name sec-edgar \
+  --account-name myaccount --auth-mode login
+```
+
+For CI/CD or non-interactive environments:
+```bash
+export AZURE_CLIENT_ID=xxx
+export AZURE_CLIENT_SECRET=xxx
+export AZURE_TENANT_ID=xxx
+```
+
+---
+
+### 6.3 What NOT To Do
+
+| Anti-pattern | Correct approach |
+|---|---|
+| AWS access keys in `.env`, config, or Docker image | ECS task IAM role via instance metadata — zero env vars |
+| `AZURE_STORAGE_ACCOUNT_KEY` anywhere | Managed Identity + `DefaultAzureCredential` |
+| Broad policies (`s3:*`, `Storage Account Contributor`) | Scope to minimum actions on specific resource ARN/ID |
+| Hardcoded credentials in `config/settings.py` | All credentials come from the runtime compute identity |
+| One IAM role/identity shared across dev/staging/prod | Separate identity per environment with separate S3 prefix |
+| Baking `AZURE_CLIENT_SECRET` into the Docker image | Set only `AZURE_CLIENT_ID` on the Batch pool; secret auth is for service principals, not managed identities |
+
+---
+
+## 7. Object Storage Layout (All Three Layers)
 
 All Bronze, Silver, and Gold data lives in object storage as Parquet. There is no separate database. Every task reads and writes exclusively to `{STORAGE_ROOT}`.
 
@@ -219,7 +499,7 @@ All Bronze, Silver, and Gold data lives in object storage as Parquet. There is n
 
 ---
 
-## 7. Bronze Layer — Parquet Schema
+## 8. Bronze Layer — Parquet Schema
 
 No DDL to run. DuckDB reads these files directly from S3/Azure Blob using `read_parquet()`. Schemas are defined by the PyArrow schemas in the ingestion scripts.
 
@@ -269,7 +549,7 @@ One row per CIK per daily ingestion. Full XBRL facts payload as a JSON string (2
 
 ---
 
-## 8. Silver Layer — Parquet Schema
+## 9. Silver Layer — Parquet Schema
 
 Silver Parquet files are written by DuckDB transform scripts. Re-running a day's transform overwrites that day's `snapshot_date=` partition (idempotent).
 
@@ -367,7 +647,7 @@ left(sha256(lpad(cast(cik as varchar), 10, '0') || '|' || upper(coalesce(ticker_
 
 ---
 
-## 9. Gold Layer — Parquet Schema
+## 10. Gold Layer — Parquet Schema
 
 Gold Parquet files are rebuilt from Silver on every run. No incremental logic.
 
@@ -398,7 +678,7 @@ Corporate events enriched with ticker and company name. Columns: `security_id`, 
 
 ---
 
-## 10. SEC EDGAR API Reference
+## 11. SEC EDGAR API Reference
 
 ### Endpoints Used
 
@@ -535,7 +815,7 @@ def period_days(start: str, end: str) -> int:
 
 ---
 
-## 11. Pipeline Scripts
+## 12. Pipeline Scripts
 
 All scripts live under `scripts/`. HTTP ingestion runs as single-node Python (not PySpark) to maintain SEC rate-limit control. Spark notebooks handle Bronze→Silver→Gold transforms.
 
@@ -613,13 +893,13 @@ from config.settings import CLOUD_PROVIDER, AWS_REGION, AZURE_ACCOUNT
 def _get_filesystem():
     if CLOUD_PROVIDER == "aws":
         import s3fs
-        return s3fs.S3FileSystem()         # uses boto3 credential chain (IAM role, env vars, ~/.aws)
+        return s3fs.S3FileSystem()         # boto3 credential chain — see Section 6.1
     if CLOUD_PROVIDER == "azure":
         import adlfs
         from azure.identity import DefaultAzureCredential
         return adlfs.AzureBlobFileSystem(
             account_name=AZURE_ACCOUNT,
-            credential=DefaultAzureCredential()   # Managed Identity, az login, env vars
+            credential=DefaultAzureCredential()   # Managed Identity via AZURE_CLIENT_ID — see Section 6.2
         )
     raise ValueError(CLOUD_PROVIDER)
 
@@ -831,10 +1111,10 @@ conn = duckdb.connect()  # in-memory only — extensions pre-installed in Docker
 if CLOUD_PROVIDER == "aws":
     conn.execute("LOAD httpfs;")
     conn.execute(f"SET s3_region='{AWS_REGION}';")
-    # Credentials come from ECS task IAM role via instance metadata — no env vars needed
+    # Credentials: ECS task IAM role (production) or ~/.aws (local) — see Section 6.1
 elif CLOUD_PROVIDER == "azure":
     conn.execute("LOAD azure;")
-    # AZURE_CLIENT_ID env var enables DefaultAzureCredential → Managed Identity
+    # Credentials: AZURE_CLIENT_ID env var → DefaultAzureCredential → Managed Identity — see Section 6.2
 
 out_path = f"{STORAGE_ROOT}/silver/dim_security/snapshot_date={INGEST_DATE}/data.parquet"
 
@@ -901,7 +1181,7 @@ conn.execute(f"""
 
 ---
 
-## 12. Orchestration
+## 13. Orchestration
 
 All three environments (local, AWS, Azure) run the **same Docker container** with different `CMD` overrides per task. Credentials are injected via environment variables; no secrets are baked into the image.
 
@@ -1060,7 +1340,7 @@ run(["scripts/silver_to_gold/01_build_gold.py"])
 
 ---
 
-## 13. Project File Layout
+## 14. Project File Layout
 
 ```
 sec_edgar_platform/
@@ -1089,7 +1369,10 @@ sec_edgar_platform/
 │   ├── adf_trigger.json                    ← Azure: Tumbling Window Trigger (daily 06:00 UTC)
 │   ├── step_functions_definition.json      ← AWS: Step Functions state machine ASL
 │   ├── ecs_task_definition.json            ← AWS: ECS task definition (taskRoleArn, awsvpc, resources)
-│   └── iam_task_role_policy.json           ← AWS: S3 read/write IAM policy
+│   └── iam/
+│       ├── ecs_task_trust.json             ← AWS: trust policy for ECS task + execution roles
+│       ├── ecs_task_role_policy.json       ← AWS: S3 read/write scoped to bucket/prefix
+│       └── sfn_role_policy.json            ← AWS: Step Functions role (ecs:RunTask + iam:PassRole)
 └── tests/
     └── test_spot_check.py                  ← DuckDB queries over S3/Azure Parquet for verification
 ```
@@ -1098,7 +1381,7 @@ sec_edgar_platform/
 
 ---
 
-## 14. Verification Steps
+## 15. Verification Steps
 
 All verification uses DuckDB reading Parquet directly from S3/Azure — no database connection needed.
 
@@ -1196,7 +1479,7 @@ Re-run the pipeline for the same date. Silver/Gold Parquet files are overwritten
 
 ---
 
-## 15. Edge Cases and Error Handling
+## 16. Edge Cases and Error Handling
 
 | Scenario | Handling |
 |---|---|
@@ -1207,8 +1490,8 @@ Re-run the pipeline for the same date. Silver/Gold Parquet files are overwritten
 | `submissions.filings.files` pagination | Fetch continuation pages, cap at 5 pages per CIK |
 | SEC rate limit across tasks | Ingest tasks run **sequentially** — each uses ≤8 req/s; never exceed 10 req/s total |
 | DuckDB extensions in VPC | Extensions are pre-installed in the Dockerfile — no runtime internet download needed |
-| DuckDB S3 auth (ECS) | Credentials come from ECS task IAM role via instance metadata — no env vars needed |
-| DuckDB Azure auth (Batch) | Set `AZURE_CLIENT_ID` env var; `DefaultAzureCredential` picks up Managed Identity |
+| DuckDB S3 auth (ECS) | ECS task IAM role via instance metadata — no env vars needed (Section 6.1.1) |
+| DuckDB Azure auth (Batch) | `AZURE_CLIENT_ID` on Batch pool → `DefaultAzureCredential` → Managed Identity (Section 6.2.4) |
 | SEC site maintenance (weekends) | Pipeline is idempotent — next run rewrites today's Silver/Gold Parquet |
 | Large companyfacts payload (>10 MB) | Store as-is in Parquet STRING column; DuckDB parses JSON in Silver transform |
 | ADF Batch pool node unavailable | ADF retries automatically; Batch scales pool nodes up/down |
@@ -1216,7 +1499,7 @@ Re-run the pipeline for the same date. Silver/Gold Parquet files are overwritten
 
 ---
 
-## 16. How to Start Coding (Post-Review Checklist)
+## 17. How to Start Coding (Post-Review Checklist)
 
 Once you have reviewed this spec and are ready to implement, follow these steps in order. Each step is independently testable.
 
@@ -1224,9 +1507,9 @@ Once you have reviewed this spec and are ready to implement, follow these steps 
 
 - [ ] **Choose cloud**: set `CLOUD_PROVIDER=aws` or `CLOUD_PROVIDER=azure` as an env var.
 - [ ] **Provision storage** (Section 5): create S3 bucket or ADLS Gen2 storage account + container.
-- [ ] **Configure credentials** locally:
-  - AWS: `aws configure` or set `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` + `AWS_DEFAULT_REGION`
-  - Azure: `az login` (DefaultAzureCredential picks it up) + set `AZURE_STORAGE_ACCOUNT` / `AZURE_CONTAINER`
+- [ ] **Configure credentials and IAM/RBAC** — follow **Section 6** completely before running any script:
+  - AWS: create ECS Task Role + Execution Role + Step Functions Role (Section 6.1); locally run `aws configure`
+  - Azure: create Managed Identity, assign RBAC roles, configure Batch pool identity (Section 6.2); locally run `az login`
 - [ ] **Create Python virtual environment**:
   ```bash
   python -m venv .venv && source .venv/bin/activate
