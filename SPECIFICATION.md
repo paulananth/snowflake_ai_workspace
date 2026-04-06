@@ -1,16 +1,16 @@
 # SEC EDGAR Security & Financial Data Platform — SPECIFICATION.md
 
-**Platform:** Databricks (cloud-agnostic)  **Architecture:** Medallion (Bronze / Silver / Gold)  **Source:** SEC EDGAR only  **Storage:** Parquet files in object storage + Delta tables
+**Platform:** Cloud-agnostic (AWS or Azure)  **Architecture:** Medallion (Bronze / Silver / Gold)  **Source:** SEC EDGAR only  **Storage:** Parquet files in S3 or Azure ADLS Gen2
 
 ## 1. System Overview
 
-This is a **greenfield** Databricks-based platform for ingesting, storing, and serving SEC EDGAR financial data. There are no existing tables, schemas, or pipelines — everything is built from scratch.
+This is a **greenfield** cloud-agnostic platform for ingesting, storing, and serving SEC EDGAR financial data. It runs on **AWS** (S3 + ECS Fargate + Step Functions) or **Azure** (ADLS Gen2 + Azure Batch + ADF) — configured by a single `CLOUD_PROVIDER` variable. No Databricks, no Spark cluster, no managed database required.
 
 **Goals:**
-- Store all raw SEC EDGAR API responses as Parquet files (auditable, reproducible)
+- Store all raw SEC EDGAR API responses as Parquet files in object storage (auditable, reproducible)
 - Build a curated security master with a stable surrogate key (`security_id`)
-- Parse XBRL financial facts into analytics-ready Delta tables
-- Support any cloud (AWS S3, Azure ADLS, GCP GCS) via a single `STORAGE_ROOT` config variable
+- Parse XBRL financial facts into analytics-ready Parquet using DuckDB as a stateless SQL engine
+- Support AWS S3 or Azure ADLS Gen2 via a single `STORAGE_ROOT` config variable
 - Serve as the foundation for a security and financial analysis system
 
 ---
@@ -21,265 +21,275 @@ This is a **greenfield** Databricks-based platform for ingesting, storing, and s
 SEC EDGAR APIs
      │
      ▼
-[Python Ingestion Driver]  ← single-node, rate-limited (≤10 req/s)
-     │  HTTP → Parquet
+[Python Ingestion Driver]  ← single-node per task, rate-limited (≤8 req/s per task, sequential tasks)
+     │  HTTP → Parquet (pyarrow + s3fs / adlfs)
      ▼
-Object Storage (STORAGE_ROOT)
-  /bronze/
-    company_tickers_exchange/ingestion_date=YYYY-MM-DD/data.parquet
-    submissions/ingestion_date=YYYY-MM-DD/cik={CIK}/data.parquet
-    companyfacts/ingestion_date=YYYY-MM-DD/cik={CIK}/data.parquet
+Object Storage  ─────────────── single source of truth (no separate database)
+  AWS:   s3://{BUCKET}/{PREFIX}/
+  Azure: abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/{PREFIX}/
+    bronze/   ← append-only Parquet (raw API responses, never modified)
+    silver/   ← Parquet written by DuckDB transform tasks
+    gold/     ← Parquet written by DuckDB transform tasks
      │
-     ▼ (Auto Loader / COPY INTO)
-[Bronze Layer]  sec_edgar_platform.bronze.*   — raw Delta tables, append-only
-     │
-     ▼ (PySpark jobs)
-[Silver Layer]  sec_edgar_platform.silver.*   — parsed, validated, deduplicated
-     │
-     ▼ (PySpark jobs)
-[Gold Layer]    sec_edgar_platform.gold.*     — analytics-ready aggregates
+     ▼ (DuckDB as stateless per-task in-memory query engine)
+Each container task:
+  reads input Parquet from S3/Azure → runs SQL transform in RAM → writes output Parquet to S3/Azure
 ```
 
 **Key design principles:**
+- No cluster, no managed database — DuckDB runs in a single Docker container
+- All state lives in object storage as Parquet — containers are fully ephemeral
 - Bronze is append-only (never updated, full audit trail)
-- Silver uses MERGE (idempotent upserts keyed on natural business keys)
+- Silver uses per-date snapshot Parquet (idempotent: overwrite today's partition on re-run)
 - Gold is rebuilt from Silver on each run (no incremental complexity)
 - `security_id` is a deterministic 16-char hex hash — stable across re-runs, no sequences needed
+- Ingest tasks run **sequentially** to stay under SEC's 10 req/s total rate limit
 
 ---
 
 ## 3. Prerequisites
 
-1. **Databricks workspace** with Unity Catalog enabled
-2. **Catalog created**: `CREATE CATALOG IF NOT EXISTS sec_edgar_platform;`
-3. **Object storage bucket/container** accessible from the workspace (any cloud)
-4. **Service principal or personal access token** with WRITE on the storage location
-5. **Python 3.11+** (for the ingestion driver script)
-6. **Databricks CLI** (`databricks`) installed and configured for job deployment
+**AWS:**
+1. **S3 bucket** in your target region (e.g. `my-sec-edgar-bucket`)
+2. **IAM role** with `s3:GetObject`, `s3:PutObject`, `s3:ListBucket` on `arn:aws:s3:::my-sec-edgar-bucket/sec-edgar/*`
+3. **ECR repository** to store the Docker image
+4. **ECS cluster** (Fargate launch type) + VPC with private subnets and a NAT Gateway (for SEC API access)
+5. **AWS Step Functions** state machine (see Section 12)
+
+**Azure:**
+1. **Storage account** with **Hierarchical Namespace enabled** (ADLS Gen2) — required for `abfss://` scheme
+2. **User-Assigned Managed Identity** granted `Storage Blob Data Contributor` on the storage account
+3. **Azure Container Registry (ACR)** to store the Docker image
+4. **Azure Batch account** with a pool configured for Docker container execution; pool identity = Managed Identity above
+5. **Azure Data Factory** pipeline (see Section 12)
+
+**Both clouds (local dev):**
+- **Python 3.11+** and **Docker** installed locally
+- **Cloud CLI** (`aws` or `az`) configured with credentials that have write access to the storage bucket/container
 
 ---
 
 ## 4. Configuration
 
-All environment-specific settings live in a single config file `config/settings.py`:
+All settings are in `config/settings.py`. Every value can be overridden by an environment variable — making the same image work locally and in cloud containers without code changes.
 
 ```python
-# config/settings.py — edit these before first run
+# config/settings.py
+import os
+from datetime import date
 
-# Root path of object storage. Examples:
-#   AWS:   "s3://my-bucket/sec-edgar"
-#   Azure: "abfss://container@account.dfs.core.windows.net/sec-edgar"
-#   GCP:   "gs://my-bucket/sec-edgar"
-STORAGE_ROOT = "s3://my-bucket/sec-edgar"   # CHANGE THIS
+# ─── Cloud provider ────────────────────────────────────────────────────────────
+CLOUD_PROVIDER = os.environ.get("CLOUD_PROVIDER", "aws")   # "aws" | "azure"
 
-CATALOG_NAME = "sec_edgar_platform"         # Unity Catalog catalog name
-BRONZE_SCHEMA = "bronze"
-SILVER_SCHEMA = "silver"
-GOLD_SCHEMA   = "gold"
+# ─── AWS ───────────────────────────────────────────────────────────────────────
+AWS_BUCKET      = os.environ.get("AWS_BUCKET",          "my-bucket")     # CHANGE THIS
+STORAGE_PREFIX  = os.environ.get("STORAGE_PREFIX",      "sec-edgar")
+AWS_REGION      = os.environ.get("AWS_DEFAULT_REGION",  "us-east-1")     # CHANGE THIS
+# Auth: ECS task IAM role (production) or ~/.aws credentials (local dev) — nothing to set here
 
-# SEC EDGAR API
-SEC_BASE_URL     = "https://data.sec.gov"
-SEC_FILES_URL    = "https://www.sec.gov/files"
-USER_AGENT       = "MyOrg DataPipeline contact@myorg.com"  # CHANGE THIS — required by SEC
-REQUEST_TIMEOUT  = 30
-MAX_RETRIES      = 3
+# ─── Azure ─────────────────────────────────────────────────────────────────────
+AZURE_ACCOUNT   = os.environ.get("AZURE_STORAGE_ACCOUNT", "myaccount")   # CHANGE THIS
+AZURE_CONTAINER = os.environ.get("AZURE_CONTAINER",       "sec-edgar")   # CHANGE THIS
+# Requires ADLS Gen2 (Hierarchical Namespace enabled on the storage account)
+# Auth: User-Assigned Managed Identity — set AZURE_CLIENT_ID env var on Batch pool
+# Local dev: `az login` (DefaultAzureCredential picks it up automatically)
 
-# Bulk ingestion tuning
-INGEST_WORKERS   = 8      # parallel HTTP threads (ThreadPoolExecutor max_workers)
-INGEST_RATE_RPS  = 8.0    # max requests/sec globally across all threads (SEC allows 10)
-BATCH_SIZE       = 500    # CIKs accumulated in memory before flushing to Parquet
+# ─── Derived storage root ──────────────────────────────────────────────────────
+def _storage_root() -> str:
+    if CLOUD_PROVIDER == "aws":
+        return f"s3://{AWS_BUCKET}/{STORAGE_PREFIX}"
+    if CLOUD_PROVIDER == "azure":
+        return f"abfss://{AZURE_CONTAINER}@{AZURE_ACCOUNT}.dfs.core.windows.net/{STORAGE_PREFIX}"
+    raise ValueError(f"Unknown CLOUD_PROVIDER: {CLOUD_PROVIDER!r}")
 
-# Exchange filter for active equities
+STORAGE_ROOT = _storage_root()
+
+# ─── SEC EDGAR API ─────────────────────────────────────────────────────────────
+USER_AGENT      = os.environ.get("SEC_USER_AGENT", "MyOrg DataPipeline contact@myorg.com")
+REQUEST_TIMEOUT = 30
+MAX_RETRIES     = 3
+
+# ─── Ingestion tuning ──────────────────────────────────────────────────────────
+INGEST_WORKERS   = 8      # parallel HTTP threads within a single task
+# Ingest tasks run SEQUENTIALLY in the pipeline (not concurrently).
+# Each task uses ≤8 req/s; sequential execution keeps combined rate under SEC's 10 req/s limit.
+INGEST_RATE_RPS  = 8.0    # max req/s per task
+BATCH_SIZE       = 500    # CIKs per Parquet batch file
 TARGET_EXCHANGES = ["NYSE", "Nasdaq"]
-```
 
-The Databricks jobs read these via `%run ./config/settings` or by importing the module.
-
----
-
-## 5. Unity Catalog Setup
-
-Run once, before anything else:
-
-```sql
--- Run as a workspace admin
-CREATE CATALOG IF NOT EXISTS sec_edgar_platform;
-
-CREATE SCHEMA IF NOT EXISTS sec_edgar_platform.bronze;
-CREATE SCHEMA IF NOT EXISTS sec_edgar_platform.silver;
-CREATE SCHEMA IF NOT EXISTS sec_edgar_platform.gold;
-
--- Register storage location (update path to match your cloud)
-CREATE EXTERNAL LOCATION IF NOT EXISTS sec_edgar_storage
-  URL 'abfss://container@account.dfs.core.windows.net/sec-edgar'  -- change this
-  WITH (STORAGE CREDENTIAL your_credential_name);                  -- change this
-
-GRANT CREATE TABLE, READ FILES, WRITE FILES
-  ON EXTERNAL LOCATION sec_edgar_storage
-  TO `data-engineers`;                                             -- change to your group
+# ─── Ingest date (injectable for backfill) ─────────────────────────────────────
+INGEST_DATE = os.environ.get("INGEST_DATE", date.today().isoformat())
 ```
 
 ---
 
-## 6. Object Storage Layout (Bronze Parquet Files)
+## 5. Storage Setup (One-Time)
 
-Raw API responses are written as Parquet under `STORAGE_ROOT`. The directory structure is:
+No catalog or database to create. The folder hierarchy is created automatically by the first Parquet write. Run these once to provision the storage resources.
+
+**AWS:**
+```bash
+# Create S3 bucket (versioning optional, encryption recommended)
+aws s3 mb s3://my-sec-edgar-bucket --region us-east-1
+aws s3api put-bucket-versioning --bucket my-sec-edgar-bucket \
+    --versioning-configuration Status=Enabled
+
+# Verify write access
+aws s3 cp /dev/null s3://my-sec-edgar-bucket/sec-edgar/.keep
+```
+
+**Azure:**
+```bash
+# Create storage account with Hierarchical Namespace (ADLS Gen2) — REQUIRED for abfss://
+az storage account create \
+  --name myaccount \
+  --resource-group my-rg \
+  --location eastus \
+  --sku Standard_LRS \
+  --enable-hierarchical-namespace true   # <-- critical: enables ADLS Gen2
+
+# Create the container
+az storage container create \
+  --name sec-edgar \
+  --account-name myaccount
+
+# Grant Managed Identity access
+az role assignment create \
+  --role "Storage Blob Data Contributor" \
+  --assignee <managed-identity-client-id> \
+  --scope /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Storage/storageAccounts/myaccount
+```
+
+---
+
+## 6. Object Storage Layout (All Three Layers)
+
+All Bronze, Silver, and Gold data lives in object storage as Parquet. There is no separate database. Every task reads and writes exclusively to `{STORAGE_ROOT}`.
 
 ```
 {STORAGE_ROOT}/
-  bronze/
+  bronze/                                  ← raw, append-only, never modified
     company_tickers_exchange/
       ingestion_date=2024-01-25/
-        data.parquet          ← full snapshot from company_tickers_exchange.json
-      ingestion_date=2024-01-26/
-        data.parquet
+        data.parquet                       ← full snapshot (~10,000–12,000 rows)
     submissions/
       ingestion_date=2024-01-25/
-        cik=0000320193/
-          data.parquet        ← one parquet per CIK
-        cik=0000789019/
-          data.parquet
+        batch_0001.parquet                 ← 500 CIKs per file
+        batch_0002.parquet
+        ...
+        batch_0016.parquet
     companyfacts/
       ingestion_date=2024-01-25/
-        cik=0000320193/
-          data.parquet
+        batch_0001.parquet                 ← 500 CIKs (~1–2 GB per file — expected)
+        ...
+  silver/                                  ← written by DuckDB transforms; re-written on re-run
+    dim_security/
+      snapshot_date=2024-01-25/
+        data.parquet
+    filings_index/
+      snapshot_date=2024-01-25/
+        data.parquet
+    financial_facts/
+      snapshot_date=2024-01-25/
+        data.parquet
+    corporate_actions/
+      snapshot_date=2024-01-25/
+        data.parquet
+  gold/                                    ← rebuilt from silver each run
+    financial_statements_annual/
+      refreshed_date=2024-01-25/
+        data.parquet
+    financial_statements_quarterly/
+      refreshed_date=2024-01-25/
+        data.parquet
+    company_profile/
+      refreshed_date=2024-01-25/
+        data.parquet
+    filing_catalog/
+      refreshed_date=2024-01-25/
+        data.parquet
+    corporate_events/
+      refreshed_date=2024-01-25/
+        data.parquet
 ```
 
-**Why Parquet (not JSON):** columnar compression (10–20× smaller), schema-on-read via Auto Loader, Delta Lake can register as external table.
+**Why Parquet (not JSON):** columnar compression (10–20× smaller), native support in DuckDB, S3 Select / Azure Query Acceleration for fast filtered reads, no database required.
+
+**No DDL needed.** DuckDB infers schema from the Parquet files. There are no `CREATE TABLE` scripts to run.
 
 ---
 
-## 7. Bronze Layer — Delta Table DDL
+## 7. Bronze Layer — Parquet Schema
 
-Run `scripts/setup/01_create_bronze_tables.sql` in a Databricks notebook or SQL editor.
+No DDL to run. DuckDB reads these files directly from S3/Azure Blob using `read_parquet()`. Schemas are defined by the PyArrow schemas in the ingestion scripts.
 
-### 7.1 `bronze.company_tickers_exchange_raw`
+### 7.1 `bronze/company_tickers_exchange/ingestion_date=*/data.parquet`
 
 One row per company per daily snapshot. Append-only.
 
-```sql
-CREATE TABLE IF NOT EXISTS sec_edgar_platform.bronze.company_tickers_exchange_raw (
-  ingestion_date   DATE         NOT NULL,
-  cik              BIGINT       NOT NULL,
-  company_name     STRING,
-  ticker           STRING,
-  exchange         STRING,
-  source_file_path STRING,                           -- full path to parquet in object storage
-  ingested_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP()
-)
-USING DELTA
-PARTITIONED BY (ingestion_date)
-TBLPROPERTIES (
-  'delta.appendOnly' = 'true',
-  'delta.autoOptimize.optimizeWrite' = 'true'
-);
-```
+| Column | Type | Notes |
+|---|---|---|
+| `ingestion_date` | `string` | ISO date, e.g. `"2024-01-25"` (Hive partition key) |
+| `cik` | `int64` | SEC CIK number |
+| `company_name` | `string` | |
+| `ticker` | `string` | |
+| `exchange` | `string` | `"NYSE"` or `"Nasdaq"` |
 
-### 7.2 `bronze.submissions_raw`
+### 7.2 `bronze/submissions/ingestion_date=*/batch_NNNN.parquet`
 
-One row per CIK per daily ingestion. Stores key metadata fields; filing arrays stored as JSON string.
+One row per CIK per daily ingestion. Filing arrays stored as JSON strings.
 
-```sql
-CREATE TABLE IF NOT EXISTS sec_edgar_platform.bronze.submissions_raw (
-  ingestion_date          DATE      NOT NULL,
-  cik                     BIGINT    NOT NULL,
-  entity_name             STRING,
-  entity_type             STRING,
-  sic                     STRING,
-  sic_description         STRING,
-  ein                     STRING,
-  category                STRING,
-  fiscal_year_end         STRING,
-  state_of_incorporation  STRING,
-  tickers_json            STRING,                   -- JSON array: ["AAPL"]
-  exchanges_json          STRING,                   -- JSON array: ["Nasdaq"]
-  filings_recent_json     STRING,                   -- full filings.recent object as JSON string
-  filings_files_json      STRING,                   -- filings.files pagination array as JSON
-  source_file_path        STRING,
-  ingested_at             TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP()
-)
-USING DELTA
-PARTITIONED BY (ingestion_date)
-CLUSTER BY (cik)
-TBLPROPERTIES ('delta.appendOnly' = 'true');
-```
+| Column | Type | Notes |
+|---|---|---|
+| `ingestion_date` | `string` | Hive partition key |
+| `cik` | `int64` | |
+| `entity_name` | `string` | |
+| `entity_type` | `string` | e.g. `"operating"` |
+| `sic` | `string` | |
+| `sic_description` | `string` | |
+| `ein` | `string` | |
+| `category` | `string` | e.g. `"Large accelerated filer"` |
+| `fiscal_year_end` | `string` | MMDD format, e.g. `"0928"` |
+| `state_of_incorporation` | `string` | |
+| `tickers_json` | `string` | JSON array: `["AAPL"]` |
+| `exchanges_json` | `string` | JSON array: `["Nasdaq"]` |
+| `filings_recent_json` | `string` | full `filings.recent` object as JSON |
+| `filings_files_json` | `string` | pagination array as JSON |
 
-### 7.3 `bronze.companyfacts_raw`
+### 7.3 `bronze/companyfacts/ingestion_date=*/batch_NNNN.parquet`
 
-One row per CIK per daily ingestion. The full facts payload as a JSON string (2–5 MB each).
+One row per CIK per daily ingestion. Full XBRL facts payload as a JSON string (2–5 MB each).
 
-```sql
-CREATE TABLE IF NOT EXISTS sec_edgar_platform.bronze.companyfacts_raw (
-  ingestion_date   DATE      NOT NULL,
-  cik              BIGINT    NOT NULL,
-  entity_name      STRING,
-  facts_json       STRING,                          -- full facts object: {"us-gaap":{...},"dei":{...}}
-  source_file_path STRING,
-  ingested_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP()
-)
-USING DELTA
-PARTITIONED BY (ingestion_date)
-CLUSTER BY (cik)
-TBLPROPERTIES ('delta.appendOnly' = 'true');
-```
-
-### 7.4 `bronze.ingestion_log`
-
-Audit trail for each pipeline run.
-
-```sql
-CREATE TABLE IF NOT EXISTS sec_edgar_platform.bronze.ingestion_log (
-  run_id           STRING    NOT NULL,              -- UUID, generated per pipeline run
-  run_date         DATE      NOT NULL,
-  pipeline_name    STRING    NOT NULL,
-  status           STRING    NOT NULL,              -- 'running' | 'success' | 'partial' | 'failed'
-  companies_total  INT,
-  companies_ok     INT,
-  companies_err    INT,
-  error_summary    STRING,
-  started_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
-  finished_at      TIMESTAMP
-)
-USING DELTA
-CLUSTER BY (run_date);
-```
+| Column | Type | Notes |
+|---|---|---|
+| `ingestion_date` | `string` | Hive partition key |
+| `cik` | `int64` | |
+| `entity_name` | `string` | |
+| `facts_json` | `string` | full `{"us-gaap":{...},"dei":{...}}` JSON |
 
 ---
 
-## 8. Silver Layer — Delta Table DDL
+## 8. Silver Layer — Parquet Schema
 
-Run `scripts/setup/02_create_silver_tables.sql`.
+Silver Parquet files are written by DuckDB transform scripts. Re-running a day's transform overwrites that day's `snapshot_date=` partition (idempotent).
 
-### 8.1 `silver.dim_security` — Security Master (Golden Record)
+### 8.1 `silver/dim_security/snapshot_date=*/data.parquet` — Security Master
 
-One row per unique security. The `security_id` is the system-wide surrogate key.
-
-```sql
-CREATE TABLE IF NOT EXISTS sec_edgar_platform.silver.dim_security (
-  security_id           STRING    NOT NULL,         -- 16-char hex, SHA-256(lpad(cik,10,'0')+'|'+upper(ticker_class))
-  cik                   BIGINT    NOT NULL,
-  ticker                STRING    NOT NULL,
-  ticker_class          STRING,                     -- NULL = primary class; 'A','B','C' = multi-class
-  company_name          STRING,
-  exchange              STRING,
-  sic                   STRING,
-  sic_description       STRING,
-  entity_type           STRING,
-  state_of_incorporation STRING,
-  fiscal_year_end       STRING,
-  category              STRING,                     -- 'Large accelerated filer', etc.
-  active_flag           BOOLEAN   NOT NULL DEFAULT TRUE,
-  inactive_reason       STRING,                     -- NULL | 'deregistered' | 'delisted' | 'stale_filings'
-  first_seen_date       DATE,                       -- first ingestion_date this CIK/ticker appeared
-  last_seen_date        DATE,                       -- most recent ingestion_date it appeared
-  source                STRING    NOT NULL DEFAULT 'sec_edgar',
-  created_at            TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP(),
-  updated_at            TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP()
-)
-USING DELTA
-CLUSTER BY (security_id, cik)
-TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true');
-```
+| Column | Type | Notes |
+|---|---|---|
+| `security_id` | `string` | 16-char hex — see generation below |
+| `cik` | `int64` | |
+| `ticker` | `string` | |
+| `ticker_class` | `string` | NULL = primary; `'A'`,`'B'` = multi-class shares |
+| `company_name` | `string` | |
+| `exchange` | `string` | |
+| `sic` | `string` | |
+| `entity_type` | `string` | |
+| `active_flag` | `boolean` | |
+| `first_seen_date` | `date` | |
+| `last_seen_date` | `date` | |
+| `created_at` | `timestamp` | |
+| `updated_at` | `timestamp` | |
 
 **`security_id` generation (Python):**
 ```python
@@ -289,286 +299,100 @@ def make_security_id(cik: int, ticker_class: str | None) -> str:
     tc = (ticker_class or "").upper().strip() or "PRIMARY"
     key = f"{str(cik).zfill(10)}|{tc}"
     return hashlib.sha256(key.encode()).hexdigest()[:16]
-
-# Example: CIK 320193, class None → make_security_id(320193, None) → fixed 16-char hex
 ```
 
-**`security_id` generation (SQL, for Silver MERGE):**
+**`security_id` generation (DuckDB SQL):**
 ```sql
-left(sha2(concat(lpad(cast(cik as string), 10, '0'), '|', upper(coalesce(ticker_class, 'PRIMARY'))), 256), 16)
+left(sha256(lpad(cast(cik as varchar), 10, '0') || '|' || upper(coalesce(ticker_class, 'PRIMARY'))), 16)
 ```
 
-### 8.2 `silver.security_xref` — Cross-Reference Table
+### 8.2 `silver/filings_index/snapshot_date=*/data.parquet`
 
-Maps every external identifier to `security_id`. Extensible to future data sources.
+| Column | Type | Notes |
+|---|---|---|
+| `security_id` | `string` | |
+| `cik` | `int64` | |
+| `accession_number` | `string` | |
+| `form_type` | `string` | `'10-K'`, `'10-Q'`, `'8-K'`, etc. |
+| `filed_date` | `date` | |
+| `period_of_report` | `date` | |
+| `filing_url` | `string` | `https://www.sec.gov/Archives/edgar/data/{cik}/{accn}/` |
+| `primary_document` | `string` | |
+| `is_xbrl` | `boolean` | |
+| `items` | `string` | 8-K items, e.g. `'2.01,9.01'` |
 
-```sql
-CREATE TABLE IF NOT EXISTS sec_edgar_platform.silver.security_xref (
-  security_id    STRING    NOT NULL,
-  source_system  STRING    NOT NULL,                -- 'sec_edgar' | 'bloomberg' | 'refinitiv' | etc.
-  id_type        STRING    NOT NULL,                -- 'CIK' | 'TICKER' | 'ISIN' | 'CUSIP' | 'FIGI'
-  id_value       STRING    NOT NULL,
-  valid_from     DATE      NOT NULL,
-  valid_to       DATE,                              -- NULL = currently valid
-  created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP()
-)
-USING DELTA
-CLUSTER BY (security_id, source_system);
+### 8.3 `silver/financial_facts/snapshot_date=*/data.parquet`
 
-### 8.3 `silver.company_ticker_history`
+| Column | Type | Notes |
+|---|---|---|
+| `security_id` | `string` | |
+| `cik` | `int64` | |
+| `period_end` | `date` | |
+| `period_start` | `date` | NULL for instant (balance sheet) concepts |
+| `form_type` | `string` | `'10-K'`, `'10-Q'`, `'10-K/A'`, `'10-Q/A'` |
+| `filed_date` | `date` | |
+| `fiscal_year` | `int32` | |
+| `fiscal_period` | `string` | `'FY'`, `'Q1'`–`'Q4'` |
+| `taxonomy` | `string` | `'us-gaap'` or `'ifrs-full'` |
+| `revenues` | `double` | |
+| `net_income` | `double` | |
+| `operating_income` | `double` | |
+| `total_assets` | `double` | |
+| `total_liabilities` | `double` | |
+| `stockholders_equity` | `double` | |
+| `long_term_debt` | `double` | |
+| `cash_and_equivalents` | `double` | |
+| `shares_outstanding` | `int64` | |
+| `operating_cash_flow` | `double` | |
+| `eps_basic` | `double` | |
+| `eps_diluted` | `double` | |
 
-Tracks changes to ticker and exchange over time (detected by diffing daily Bronze snapshots).
+### 8.4 `silver/corporate_actions/snapshot_date=*/data.parquet`
 
-```sql
-CREATE TABLE IF NOT EXISTS sec_edgar_platform.silver.company_ticker_history (
-  security_id    STRING    NOT NULL,
-  cik            BIGINT    NOT NULL,
-  ticker         STRING    NOT NULL,
-  exchange       STRING,
-  change_type    STRING    NOT NULL,                -- 'added' | 'removed' | 'exchange_changed' | 'ticker_changed'
-  change_date    DATE      NOT NULL,
-  old_ticker     STRING,
-  old_exchange   STRING,
-  detected_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP()
-)
-USING DELTA
-CLUSTER BY (cik, change_date);
-```
-
-### 8.4 `silver.filings_index`
-
-Lightweight catalog of company filings. No document content stored.
-
-```sql
-CREATE TABLE IF NOT EXISTS sec_edgar_platform.silver.filings_index (
-  security_id      STRING    NOT NULL,
-  cik              BIGINT    NOT NULL,
-  accession_number STRING    NOT NULL,
-  form_type        STRING    NOT NULL,
-  filed_date       DATE      NOT NULL,
-  period_of_report DATE,
-  filing_url       STRING,                         -- https://www.sec.gov/Archives/edgar/data/{cik}/{accn_clean}/
-  primary_document STRING,
-  is_xbrl          BOOLEAN,
-  items            STRING,                         -- 8-K items, e.g. '2.01,9.01'
-  ingested_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP()
-)
-USING DELTA
-CLUSTER BY (security_id, filed_date)
-TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true');
-```
-
-### 8.5 `silver.financial_facts`
-
-One row per company per reporting period per form type. Covers all key XBRL concepts.
-
-```sql
-CREATE TABLE IF NOT EXISTS sec_edgar_platform.silver.financial_facts (
-  security_id          STRING    NOT NULL,
-  cik                  BIGINT    NOT NULL,
-  period_end           DATE      NOT NULL,
-  period_start         DATE,                       -- NULL for instant (balance sheet) concepts
-  form_type            STRING    NOT NULL,         -- '10-K' | '10-Q' | '10-K/A' | '10-Q/A'
-  filed_date           DATE      NOT NULL,
-  fiscal_year          INT,
-  fiscal_period        STRING,                     -- 'FY' | 'Q1' | 'Q2' | 'Q3' | 'Q4'
-  taxonomy             STRING    NOT NULL,         -- 'us-gaap' | 'ifrs-full'
-  -- Income Statement
-  revenues             DECIMAL(22,2),
-  net_income           DECIMAL(22,2),
-  operating_income     DECIMAL(22,2),
-  -- Balance Sheet (instant)
-  total_assets         DECIMAL(22,2),
-  total_liabilities    DECIMAL(22,2),
-  stockholders_equity  DECIMAL(22,2),
-  long_term_debt       DECIMAL(22,2),
-  cash_and_equivalents DECIMAL(22,2),
-  shares_outstanding   BIGINT,
-  -- Cash Flow
-  operating_cash_flow  DECIMAL(22,2),
-  -- Per-Share
-  eps_basic            DECIMAL(14,4),
-  eps_diluted          DECIMAL(14,4),
-  ingested_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP()
-)
-USING DELTA
-CLUSTER BY (security_id, period_end)
-TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true');
-```
-
-### 8.6 `silver.corporate_actions`
-
-Corporate events detected from filing form types.
-
-```sql
-CREATE TABLE IF NOT EXISTS sec_edgar_platform.silver.corporate_actions (
-  security_id              STRING    NOT NULL,
-  cik                      BIGINT    NOT NULL,
-  event_type               STRING    NOT NULL,     -- see vocabulary below
-  event_date               DATE      NOT NULL,
-  effective_date           DATE,
-  accession_number         STRING,
-  form_type                STRING,
-  filed_date               DATE,
-  counterparty_cik         BIGINT,
-  counterparty_name        STRING,
-  split_ratio_numerator    INT,
-  split_ratio_denominator  INT,
-  description              STRING,
-  ingested_at              TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP()
-)
-USING DELTA
-CLUSTER BY (security_id, event_date);
--- event_type vocabulary: 'merger_acquisition' | 'bankruptcy_filing' | 'stock_split'
---                        | 'reverse_split' | 'deregistration' | 'going_private'
-```
+| Column | Type | `event_type` vocabulary |
+|---|---|---|
+| `security_id` | `string` | `'merger_acquisition'` |
+| `cik` | `int64` | `'bankruptcy_filing'` |
+| `event_type` | `string` | `'stock_split'` |
+| `event_date` | `date` | `'reverse_split'` |
+| `effective_date` | `date` | `'deregistration'` |
+| `accession_number` | `string` | `'going_private'` |
+| `form_type` | `string` | |
+| `filed_date` | `date` | |
+| `counterparty_cik` | `int64` | |
+| `counterparty_name` | `string` | |
+| `split_ratio_numerator` | `int32` | |
+| `split_ratio_denominator` | `int32` | |
+| `description` | `string` | |
 
 ---
 
----
+## 9. Gold Layer — Parquet Schema
 
-## 9. Gold Layer — Delta Table DDL
+Gold Parquet files are rebuilt from Silver on every run. No incremental logic.
 
-Run `scripts/setup/03_create_gold_tables.sql`. Gold tables are fully rebuilt from Silver on each run.
+### 9.1 `gold/financial_statements_annual/refreshed_date=*/data.parquet`
 
-### 9.1 `gold.financial_statements_annual`
+Columns: `security_id`, `cik`, `ticker`, `company_name`, `exchange`, `fiscal_year`, `period_end`, `filed_date`, `taxonomy`, `revenues`, `net_income`, `operating_income`, `total_assets`, `total_liabilities`, `stockholders_equity`, `long_term_debt`, `cash_and_equivalents`, `operating_cash_flow`, `eps_basic`, `eps_diluted`, plus derived ratios:
+- `net_margin` = `net_income / revenues`
+- `return_on_equity` = `net_income / stockholders_equity`
+- `debt_to_equity` = `long_term_debt / stockholders_equity`
 
-```sql
-CREATE TABLE IF NOT EXISTS sec_edgar_platform.gold.financial_statements_annual (
-  security_id          STRING,
-  cik                  BIGINT,
-  ticker               STRING,
-  company_name         STRING,
-  exchange             STRING,
-  fiscal_year          INT,
-  period_end           DATE,
-  filed_date           DATE,
-  taxonomy             STRING,
-  revenues             DECIMAL(22,2),
-  net_income           DECIMAL(22,2),
-  operating_income     DECIMAL(22,2),
-  total_assets         DECIMAL(22,2),
-  total_liabilities    DECIMAL(22,2),
-  stockholders_equity  DECIMAL(22,2),
-  long_term_debt       DECIMAL(22,2),
-  cash_and_equivalents DECIMAL(22,2),
-  operating_cash_flow  DECIMAL(22,2),
-  eps_basic            DECIMAL(14,4),
-  eps_diluted          DECIMAL(14,4),
-  -- Derived ratios
-  net_margin           DECIMAL(10,6),              -- net_income / revenues
-  return_on_equity     DECIMAL(10,6),              -- net_income / stockholders_equity
-  debt_to_equity       DECIMAL(10,6),              -- long_term_debt / stockholders_equity
-  refreshed_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP()
-)
-USING DELTA
-CLUSTER BY (ticker, fiscal_year);
-```
+### 9.2 `gold/financial_statements_quarterly/refreshed_date=*/data.parquet`
 
-### 9.2 `gold.financial_statements_quarterly`
+Same as annual plus `fiscal_period` (`'Q1'`–`'Q4'`). Most recent 8 quarters.
 
-Same structure as annual, but for quarterly (10-Q) periods. Most recent 8 quarters.
+### 9.3 `gold/company_profile/refreshed_date=*/data.parquet`
 
-```sql
-CREATE TABLE IF NOT EXISTS sec_edgar_platform.gold.financial_statements_quarterly (
-  security_id          STRING,
-  cik                  BIGINT,
-  ticker               STRING,
-  company_name         STRING,
-  exchange             STRING,
-  fiscal_year          INT,
-  fiscal_period        STRING,                     -- 'Q1' | 'Q2' | 'Q3' | 'Q4'
-  period_end           DATE,
-  filed_date           DATE,
-  taxonomy             STRING,
-  revenues             DECIMAL(22,2),
-  net_income           DECIMAL(22,2),
-  operating_income     DECIMAL(22,2),
-  total_assets         DECIMAL(22,2),
-  total_liabilities    DECIMAL(22,2),
-  stockholders_equity  DECIMAL(22,2),
-  long_term_debt       DECIMAL(22,2),
-  cash_and_equivalents DECIMAL(22,2),
-  operating_cash_flow  DECIMAL(22,2),
-  eps_basic            DECIMAL(14,4),
-  eps_diluted          DECIMAL(14,4),
-  refreshed_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP()
-)
-USING DELTA
-CLUSTER BY (ticker, period_end);
-```
+One row per security. Columns: `security_id`, `cik`, `ticker`, `company_name`, `exchange`, `sic`, `sic_description`, `state_of_incorporation`, `fiscal_year_end`, `active_flag`, `inactive_reason`, `latest_10k_date`, `latest_10q_date`, `latest_revenues`, `latest_total_assets`, `latest_shares_outstanding`, `latest_eps_diluted`.
 
-### 9.3 `gold.company_profile`
+### 9.4 `gold/filing_catalog/refreshed_date=*/data.parquet`
 
-One row per security. Combines security master + latest financials.
+All indexed filings. Columns: `security_id`, `cik`, `ticker`, `company_name`, `accession_number`, `form_type`, `filed_date`, `period_of_report`, `filing_url`, `primary_document`.
 
-```sql
-CREATE TABLE IF NOT EXISTS sec_edgar_platform.gold.company_profile (
-  security_id          STRING,
-  cik                  BIGINT,
-  ticker               STRING,
-  company_name         STRING,
-  exchange             STRING,
-  sic                  STRING,
-  sic_description      STRING,
-  state_of_incorporation STRING,
-  fiscal_year_end      STRING,
-  active_flag          BOOLEAN,
-  inactive_reason      STRING,
-  latest_10k_date      DATE,
-  latest_10q_date      DATE,
-  latest_revenues      DECIMAL(22,2),
-  latest_total_assets  DECIMAL(22,2),
-  latest_shares_outstanding BIGINT,
-  latest_eps_diluted   DECIMAL(14,4),
-  refreshed_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP()
-)
-USING DELTA
-CLUSTER BY (ticker);
-```
+### 9.5 `gold/corporate_events/refreshed_date=*/data.parquet`
 
-### 9.4 `gold.filing_catalog`
-
-All indexed filings with direct URLs, joinable to company_profile.
-
-```sql
-CREATE TABLE IF NOT EXISTS sec_edgar_platform.gold.filing_catalog (
-  security_id      STRING,
-  cik              BIGINT,
-  ticker           STRING,
-  company_name     STRING,
-  accession_number STRING,
-  form_type        STRING,
-  filed_date       DATE,
-  period_of_report DATE,
-  filing_url       STRING,
-  primary_document STRING,
-  refreshed_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP()
-)
-USING DELTA
-CLUSTER BY (ticker, filed_date);
-```
-
-### 9.5 `gold.corporate_events`
-
-Corporate events enriched with company name and ticker for easy querying.
-
-```sql
-CREATE TABLE IF NOT EXISTS sec_edgar_platform.gold.corporate_events (
-  security_id     STRING,
-  cik             BIGINT,
-  ticker          STRING,
-  company_name    STRING,
-  event_type      STRING,
-  event_date      DATE,
-  effective_date  DATE,
-  form_type       STRING,
-  filed_date      DATE,
-  description     STRING,
-  refreshed_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP()
-)
-USING DELTA
-CLUSTER BY (ticker, event_date);
+Corporate events enriched with ticker and company name. Columns: `security_id`, `cik`, `ticker`, `company_name`, `event_type`, `event_date`, `effective_date`, `form_type`, `filed_date`, `description`.
 
 ---
 
@@ -780,18 +604,34 @@ def edgar_get(url: str, session: requests.Session, max_retries: int = 3):
     return None                             # exhausted retries
 ```
 
-**Batch writer (shared):**
+**Batch writer (shared) — uses fsspec for cloud-agnostic writes:**
 ```python
 # scripts/ingest/_batch_writer.py
 import pyarrow as pa, pyarrow.parquet as pq
-from pathlib import PurePosixPath
+from config.settings import CLOUD_PROVIDER, AWS_REGION, AZURE_ACCOUNT
+
+def _get_filesystem():
+    if CLOUD_PROVIDER == "aws":
+        import s3fs
+        return s3fs.S3FileSystem()         # uses boto3 credential chain (IAM role, env vars, ~/.aws)
+    if CLOUD_PROVIDER == "azure":
+        import adlfs
+        from azure.identity import DefaultAzureCredential
+        return adlfs.AzureBlobFileSystem(
+            account_name=AZURE_ACCOUNT,
+            credential=DefaultAzureCredential()   # Managed Identity, az login, env vars
+        )
+    raise ValueError(CLOUD_PROVIDER)
+
+_FS = _get_filesystem()
 
 def write_batch(records: list[dict], schema: pa.Schema,
                 storage_root: str, dataset: str,
-                ingest_date: str, batch_num: int):
-    table = pa.Table.from_pylist(records, schema=schema)
+                ingest_date: str, batch_num: int) -> str:
     path = f"{storage_root}/bronze/{dataset}/ingestion_date={ingest_date}/batch_{batch_num:04d}.parquet"
-    pq.write_table(table, path, compression="snappy")
+    table = pa.Table.from_pylist(records, schema=schema)
+    with _FS.open(path, "wb") as f:
+        pq.write_table(table, f, compression="snappy")
     return path
 ```
 
@@ -978,202 +818,244 @@ def fetch_one(cik: int, session, ingest_date: str) -> dict | None:
 # run() identical to 02_ingest_submissions.py — swap SCHEMA and fetch_one
 ```
 
-### 11.4 `scripts/ingest/04_load_bronze_delta.py` — Bulk Bronze Delta Load (Spark)
+### 11.4 `scripts/bronze_to_silver/01_silver_dim_security.py` — Security Master
 
-Runs **after all three ingestion scripts complete**. Loads all batch Parquet files into their Delta tables using `COPY INTO` (idempotent, tracks already-loaded files).
+DuckDB stateless transform. Reads today's bronze tickers Parquet from S3/Azure, writes silver `dim_security` Parquet back to S3/Azure. No local DB file.
 
 ```python
-# Databricks notebook / PySpark script
-from datetime import date
-from config.settings import STORAGE_ROOT, CATALOG_NAME
+import duckdb, os
+from config.settings import STORAGE_ROOT, CLOUD_PROVIDER, AWS_REGION, INGEST_DATE
 
-today = date.today().isoformat()
+conn = duckdb.connect()  # in-memory only — extensions pre-installed in Dockerfile
 
-# Load each dataset — COPY INTO is idempotent (skips already-loaded files)
-for dataset, table in [
-    ("company_tickers_exchange", "bronze.company_tickers_exchange_raw"),
-    ("submissions",              "bronze.submissions_raw"),
-    ("companyfacts",             "bronze.companyfacts_raw"),
-]:
-    path = f"{STORAGE_ROOT}/bronze/{dataset}/ingestion_date={today}/"
-    spark.sql(f"""
-        COPY INTO {CATALOG_NAME}.{table}
-        FROM '{path}'
-        FILEFORMAT = PARQUET
-        FORMAT_OPTIONS ('inferSchema' = 'false', 'mergeSchema' = 'false')
-        COPY_OPTIONS ('mergeSchema' = 'false')
-    """)
-    count = spark.sql(f"SELECT COUNT(*) FROM {CATALOG_NAME}.{table} WHERE ingestion_date = '{today}'").collect()[0][0]
-    print(f"{table}: loaded {count:,} rows for {today}")
+if CLOUD_PROVIDER == "aws":
+    conn.execute("LOAD httpfs;")
+    conn.execute(f"SET s3_region='{AWS_REGION}';")
+    # Credentials come from ECS task IAM role via instance metadata — no env vars needed
+elif CLOUD_PROVIDER == "azure":
+    conn.execute("LOAD azure;")
+    # AZURE_CLIENT_ID env var enables DefaultAzureCredential → Managed Identity
+
+out_path = f"{STORAGE_ROOT}/silver/dim_security/snapshot_date={INGEST_DATE}/data.parquet"
+
+conn.execute(f"""
+  COPY (
+    SELECT
+      left(sha256(lpad(cast(cik as varchar), 10, '0') || '|' || 'PRIMARY'), 16) AS security_id,
+      cik,
+      ticker,
+      NULL::VARCHAR                AS ticker_class,
+      company_name,
+      exchange,
+      NULL::VARCHAR                AS sic,
+      NULL::VARCHAR                AS entity_type,
+      TRUE                         AS active_flag,
+      '{INGEST_DATE}'::DATE        AS first_seen_date,
+      '{INGEST_DATE}'::DATE        AS last_seen_date,
+      current_timestamp            AS created_at,
+      current_timestamp            AS updated_at
+    FROM read_parquet('{STORAGE_ROOT}/bronze/company_tickers_exchange/ingestion_date={INGEST_DATE}/*.parquet')
+    WHERE exchange IN ('NYSE', 'Nasdaq')
+  ) TO '{out_path}' (FORMAT PARQUET, COMPRESSION SNAPPY)
+""")
+print(f"Written dim_security → {out_path}")
+conn.close()
 ```
 
-### 11.5 `scripts/bronze_to_silver/01_silver_dim_security.py` — Security Master
+### 11.5 `scripts/bronze_to_silver/02_silver_filings_and_facts.py`
 
-Reads from Bronze `company_tickers_exchange_raw` (today's partition only). Computes `security_id` and MERGEs into `silver.dim_security`.
+DuckDB stateless transform. Reads today's bronze `submissions_raw` and `companyfacts_raw` Parquet from S3/Azure. Parses filings parallel arrays (JSON) and XBRL concepts. Writes silver `filings_index`, `financial_facts`, and `corporate_actions` Parquet to S3/Azure.
+
+Key operations:
+- Unnest `filings_recent_json` using DuckDB's `json_extract` and `unnest` to expand parallel arrays
+- For each XBRL concept in `financial_facts`, apply period filtering (see Section 10) and pick primary/fallback mapping
+- For `corporate_actions`, detect event types by `form_type` and `items` values (see Section 10)
+
+### 11.6 `scripts/silver_to_gold/01_build_gold.py`
+
+DuckDB stateless transform. Reads silver Parquet from S3/Azure, writes gold Parquet back to S3/Azure. Rebuilds all gold files from scratch on every run.
 
 ```python
-from pyspark.sql import functions as F
-from datetime import date
-
-today = date.today().isoformat()
-
-bronze = spark.table("sec_edgar_platform.bronze.company_tickers_exchange_raw") \
-    .filter(F.col("ingestion_date") == today) \
-    .filter(F.col("exchange").isin(["NYSE", "Nasdaq"]))
-
-silver_candidates = bronze.withColumn(
-    "security_id",
-    F.left(F.sha2(F.concat(
-        F.lpad(F.col("cik").cast("string"), 10, "0"),
-        F.lit("|"),
-        F.lit("PRIMARY")), 256), 16)
-).withColumn("active_flag", F.lit(True)) \
- .withColumn("first_seen_date", F.lit(today).cast("date")) \
- .withColumn("last_seen_date",  F.lit(today).cast("date"))
-
-silver_candidates.createOrReplaceTempView("new_securities")
-
-spark.sql("""
-  MERGE INTO sec_edgar_platform.silver.dim_security AS t
-  USING new_securities AS s ON t.security_id = s.security_id
-  WHEN MATCHED THEN UPDATE SET
-    t.last_seen_date = s.last_seen_date,
-    t.company_name   = s.company_name,
-    t.exchange       = s.exchange,
-    t.updated_at     = current_timestamp()
-  WHEN NOT MATCHED THEN INSERT *
+# Pattern for each gold table:
+conn.execute(f"""
+  COPY (
+    SELECT
+      s.security_id, s.cik, s.ticker, s.company_name, s.exchange,
+      f.fiscal_year, f.period_end, f.filed_date, f.taxonomy,
+      f.revenues, f.net_income, f.operating_income,
+      f.total_assets, f.total_liabilities, f.stockholders_equity,
+      f.long_term_debt, f.cash_and_equivalents, f.operating_cash_flow,
+      f.eps_basic, f.eps_diluted,
+      f.net_income / NULLIF(f.revenues, 0)             AS net_margin,
+      f.net_income / NULLIF(f.stockholders_equity, 0)  AS return_on_equity,
+      f.long_term_debt / NULLIF(f.stockholders_equity, 0) AS debt_to_equity,
+      current_timestamp AS refreshed_at
+    FROM read_parquet('{STORAGE_ROOT}/silver/dim_security/snapshot_date={INGEST_DATE}/*.parquet') s
+    JOIN read_parquet('{STORAGE_ROOT}/silver/financial_facts/snapshot_date={INGEST_DATE}/*.parquet') f
+      ON s.security_id = f.security_id
+    WHERE f.form_type IN ('10-K', '10-K/A')
+  ) TO '{STORAGE_ROOT}/gold/financial_statements_annual/refreshed_date={INGEST_DATE}/data.parquet'
+  (FORMAT PARQUET, COMPRESSION SNAPPY)
 """)
 ```
 
-### 11.6 `scripts/bronze_to_silver/02_silver_filings_and_facts.py`
-
-PySpark. Reads Bronze `submissions_raw` and `companyfacts_raw` (today's partition). Parses filings parallel arrays and XBRL concepts. MERGEs into `silver.filings_index`, `silver.financial_facts`, `silver.corporate_actions`.
-
-### 11.7 `scripts/silver_to_gold/01_build_gold.py`
-
-PySpark. Rebuilds all Gold tables from Silver using `CREATE OR REPLACE TABLE ... AS SELECT`. See Section 9 for the SQL patterns.
-
 ---
 
-## 12. Databricks Workflow YAML
+## 12. Orchestration
 
-Save as `workflows/sec_edgar_daily.yml`. Deploy with `databricks bundle deploy`.
+All three environments (local, AWS, Azure) run the **same Docker container** with different `CMD` overrides per task. Credentials are injected via environment variables; no secrets are baked into the image.
 
-**Pipeline execution order (enforced by task dependencies):**
+**Pipeline execution order — tasks run sequentially:**
 ```
-ingest_tickers ──────────────────────────────────────────────────────────────────────┐
-                                                                                     │
-ingest_tickers → ingest_submissions (bulk parallel, 8 workers) ──────────────────────┤
-                                                                                     ├─→ load_bronze_delta → [GATE: bronze_ingestion_complete]
-ingest_tickers → ingest_companyfacts (bulk parallel, 8 workers) ─────────────────────┘                              │
-                                                                                                                     ▼
-                                                                                                         silver_security_master
-                                                                                                                     │
-                                                                                                         silver_filings_facts
-                                                                                                                     │
-                                                                                                             build_gold
+[ingest_tickers]          ← Stage 1: 1 HTTP call, writes data.parquet
+         │
+         ▼
+[ingest_submissions]      ← Stage 2a: 8 req/s, writes batch_NNNN.parquet (~16 files)
+         │
+         ▼
+[ingest_companyfacts]     ← Stage 2b: 8 req/s sequential (NOT parallel with Stage 2a)
+         │                             Reason: combined 16 req/s would exceed SEC's 10 req/s limit
+         ▼
+[bronze_gate]             ← asserts Parquet file count > 0 for all 3 bronze datasets
+         │
+         ▼
+[silver_dim_security]     ← DuckDB in-memory: bronze tickers → silver/dim_security/
+         │
+         ▼
+[silver_filings_facts]    ← DuckDB in-memory: bronze submissions+facts → silver/filings_index/, financial_facts/, corporate_actions/
+         │
+         ▼
+[build_gold]              ← DuckDB in-memory: silver → gold/ (all 5 tables)
 ```
 
-**Rule:** No Silver or Gold task may start until `bronze_ingestion_complete` succeeds.
+**Rule:** All bronze tasks must complete before any silver task starts. The `bronze_gate` task enforces this.
 
-```yaml
-# workflows/sec_edgar_daily.yml
-bundle:
-  name: sec_edgar_platform
+### 12.1 Docker Container (all environments)
 
-resources:
-  jobs:
-    sec_edgar_daily:
-      name: "SEC EDGAR Daily Pipeline"
-      schedule:
-        quartz_cron_expression: "0 0 6 * * ?"    # 06:00 UTC daily
-        timezone_id: "UTC"
-      job_clusters:
-        - job_cluster_key: spark_cluster
-          new_cluster:
-            spark_version: "15.4.x-scala2.12"
-            node_type_id: "i3.xlarge"            # change for your cloud
-            num_workers: 2
-            spark_conf:
-              spark.databricks.delta.optimizeWrite.enabled: "true"
-              spark.databricks.delta.optimizeWrite.binSize: "1073741824"  # 1 GB bins
+```dockerfile
+# Dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+# Pre-install DuckDB extensions — containers in private VPCs have no internet egress
+RUN python -c "import duckdb; c=duckdb.connect(); c.execute('INSTALL httpfs; INSTALL azure;')"
+COPY . .
+ENTRYPOINT ["python"]
+CMD ["-m", "pipeline"]
+```
 
-      tasks:
+```
+# requirements.txt
+requests>=2.31
+pyarrow>=14.0
+s3fs>=2024.2.0
+adlfs>=2024.2.0
+azure-identity>=1.15
+duckdb>=1.0.0
+```
 
-        # ── STAGE 1: Download tickers (1 HTTP call, prerequisite for CIK list) ──────
-        - task_key: ingest_tickers
-          description: "Download company_tickers_exchange.json → Parquet (1 file)"
-          spark_python_task:
-            python_file: "scripts/ingest/01_ingest_tickers_exchange.py"
-          libraries:
-            - pypi: { package: "requests" }
-            - pypi: { package: "pyarrow" }
+Push to registry:
+- **AWS**: `docker build -t {account}.dkr.ecr.{region}.amazonaws.com/sec-edgar-ingest:latest . && docker push ...`
+- **Azure**: `docker build -t {registry}.azurecr.io/sec-edgar-ingest:latest . && docker push ...`
 
-        # ── STAGE 2: Bulk parallel HTTP fetch (submissions + facts run concurrently) ─
-        - task_key: ingest_submissions
-          description: "Bulk fetch submissions (8 workers, batch Parquet)"
-          depends_on: [{ task_key: ingest_tickers }]
-          spark_python_task:
-            python_file: "scripts/ingest/02_ingest_submissions.py"
-          libraries:
-            - pypi: { package: "requests" }
-            - pypi: { package: "pyarrow" }
+### 12.2 Option A — Azure Data Factory (ADF)
 
-        - task_key: ingest_companyfacts
-          description: "Bulk fetch companyfacts/XBRL (8 workers, batch Parquet)"
-          depends_on: [{ task_key: ingest_tickers }]
-          spark_python_task:
-            python_file: "scripts/ingest/03_ingest_companyfacts.py"
-          libraries:
-            - pypi: { package: "requests" }
-            - pypi: { package: "pyarrow" }
+**Infrastructure requirements:**
+| Component | Requirement |
+|---|---|
+| Storage account | ADLS Gen2 (Hierarchical Namespace **must** be enabled) |
+| Azure Batch pool | Ubuntu 22.04 + `containerConfiguration` enabled; pool identity = User-Assigned Managed Identity |
+| ACR | Stores Docker image; Batch pool identity has `AcrPull` role |
+| Managed Identity | `Storage Blob Data Contributor` on the ADLS Gen2 storage account |
 
-        # ── STAGE 3: Load all Parquet batches into Bronze Delta (COPY INTO) ─────────
-        - task_key: load_bronze_delta
-          description: "COPY INTO all batch Parquet files → Bronze Delta tables"
-          depends_on:
-            - { task_key: ingest_tickers }
-            - { task_key: ingest_submissions }
-            - { task_key: ingest_companyfacts }
-          job_cluster_key: spark_cluster
-          notebook_task:
-            notebook_path: "scripts/ingest/04_load_bronze_delta"
+**ADF pipeline** (`workflows/adf_pipeline.json`): Custom Activity per task, all on Azure Batch. Dependencies expressed as ADF activity dependencies.
 
-        # ── GATE: all raw data in Delta before any Silver/Gold task starts ──────────
-        - task_key: bronze_ingestion_complete
-          description: "GATE — verifies row counts in all Bronze tables for today"
-          depends_on: [{ task_key: load_bronze_delta }]
-          job_cluster_key: spark_cluster
-          notebook_task:
-            notebook_path: "scripts/ingest/05_verify_bronze_complete"
-          # This notebook asserts:
-          #   bronze.company_tickers_exchange_raw has rows for today
-          #   bronze.submissions_raw has rows for today
-          #   bronze.companyfacts_raw has rows for today
-          # Raises exception (fails the task) if any assertion fails → stops pipeline
+**Passing parameters to container**: Use CLI args in the `command` field (not `extendedProperties`):
+```json
+{
+  "name": "ingest_tickers",
+  "type": "Custom",
+  "linkedServiceName": { "referenceName": "AzureBatchLS" },
+  "typeProperties": {
+    "command": "scripts/ingest/01_ingest_tickers_exchange.py --date @{pipeline().parameters.ingestDate}",
+    "resourceLinkedService": { "referenceName": "AzureStorageLS" },
+    "folderPath": "sec-edgar-adf-scripts"
+  }
+}
+```
 
-        # ── STAGE 4: Silver transforms (only start after bronze_ingestion_complete) ──
-        - task_key: silver_security_master
-          description: "Bronze → Silver: dim_security + security_xref"
-          depends_on: [{ task_key: bronze_ingestion_complete }]
-          job_cluster_key: spark_cluster
-          notebook_task:
-            notebook_path: "scripts/bronze_to_silver/01_silver_dim_security"
+**Trigger**: Tumbling Window Trigger (not Schedule Trigger) — guarantees exactly-once execution per 24h window, supports backfill of missed windows.
 
-        - task_key: silver_filings_facts
-          description: "Bronze → Silver: filings_index + financial_facts + corporate_actions"
-          depends_on: [{ task_key: silver_security_master }]
-          job_cluster_key: spark_cluster
-          notebook_task:
-            notebook_path: "scripts/bronze_to_silver/02_silver_filings_and_facts"
+Files to create: `workflows/adf_pipeline.json`, `workflows/adf_linked_services.json`, `workflows/adf_trigger.json`
 
-        # ── STAGE 5: Gold (only after all Silver complete) ────────────────────────────
-        - task_key: build_gold
-          description: "Silver → Gold: all analytics tables"
-          depends_on: [{ task_key: silver_filings_facts }]
-          job_cluster_key: spark_cluster
-          notebook_task:
-            notebook_path: "scripts/silver_to_gold/01_build_gold"
+### 12.3 Option B — AWS Step Functions + ECS Fargate
+
+**Infrastructure requirements:**
+| Component | Requirement |
+|---|---|
+| S3 bucket | Standard; versioning optional |
+| ECS cluster | Fargate launch type |
+| VPC | Private subnets + NAT Gateway (for SEC API outbound; ~$0.045/hr) |
+| ECS task role | `s3:GetObject`, `s3:PutObject`, `s3:ListBucket` on `{bucket}/{prefix}/*` |
+| ECR | Stores Docker image; task execution role has ECR pull permission |
+
+**Step Functions state machine** (`workflows/step_functions_definition.json`): each state runs a Fargate task with a CMD override. `NetworkConfiguration` is required for Fargate.
+
+```json
+{
+  "Type": "Task",
+  "Resource": "arn:aws:states:::ecs:runTask.sync",
+  "Parameters": {
+    "Cluster": "arn:aws:ecs:{region}:{account}:cluster/sec-edgar-cluster",
+    "TaskDefinition": "arn:aws:ecs:{region}:{account}:task-definition/sec-edgar-ingest",
+    "LaunchType": "FARGATE",
+    "NetworkConfiguration": {
+      "AwsvpcConfiguration": {
+        "Subnets.$":        "$.subnets",
+        "SecurityGroups.$": "$.securityGroups",
+        "AssignPublicIp":   "DISABLED"
+      }
+    },
+    "Overrides": {
+      "ContainerOverrides": [{
+        "Name": "sec-edgar",
+        "Command.$": "States.Array('scripts/ingest/01_ingest_tickers_exchange.py', '--date', $.ingestDate)",
+        "Environment": [
+          { "Name": "CLOUD_PROVIDER", "Value": "aws" }
+        ]
+      }]
+    }
+  },
+  "Retry": [{ "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 30, "MaxAttempts": 2 }]
+}
+```
+
+**Trigger**: EventBridge Scheduler at 06:00 UTC daily, passing today's date as `$.ingestDate`.
+
+Files to create: `workflows/step_functions_definition.json`, `workflows/ecs_task_definition.json`, `workflows/iam_task_role_policy.json`
+
+### 12.4 Option C — Local / Dev (`pipeline.py`)
+
+```python
+# pipeline.py — sequential local runner
+import subprocess, concurrent.futures
+from config.settings import INGEST_DATE
+
+def run(args): subprocess.run(["python"] + args, check=True)
+
+# Stage 1
+run(["scripts/ingest/01_ingest_tickers_exchange.py", "--date", INGEST_DATE])
+# Stage 2 — sequential (not parallel, to respect SEC rate limit)
+run(["scripts/ingest/02_ingest_submissions.py",  "--date", INGEST_DATE])
+run(["scripts/ingest/03_ingest_companyfacts.py", "--date", INGEST_DATE])
+# Bronze gate
+run(["scripts/ingest/bronze_gate.py"])
+# Silver
+run(["scripts/bronze_to_silver/01_silver_dim_security.py"])
+run(["scripts/bronze_to_silver/02_silver_filings_and_facts.py"])
+# Gold
+run(["scripts/silver_to_gold/01_build_gold.py"])
 ```
 
 ---
@@ -1182,108 +1064,135 @@ resources:
 
 ```
 sec_edgar_platform/
+├── Dockerfile                              ← single image for ADF Batch, ECS Fargate, and local
+├── requirements.txt                        ← pyarrow, s3fs, adlfs, azure-identity, duckdb, requests
+├── pipeline.py                             ← local/dev sequential runner (Option C)
 ├── config/
-│   └── settings.py                         ← EDIT THIS: STORAGE_ROOT, USER_AGENT
+│   └── settings.py                         ← CLOUD_PROVIDER, storage config (all from env vars)
 ├── scripts/
-│   ├── setup/
-│   │   ├── 00_unity_catalog_setup.sql      ← run once as admin
-│   │   ├── 01_create_bronze_tables.sql
-│   │   ├── 02_create_silver_tables.sql
-│   │   └── 03_create_gold_tables.sql
 │   ├── ingest/
-│   │   ├── _rate_limiter.py                ← shared RateLimiter (8 req/s)
+│   │   ├── _rate_limiter.py                ← thread-safe RateLimiter (8 req/s per task)
 │   │   ├── _http.py                        ← edgar_get() with retry + rate limit
-│   │   ├── _batch_writer.py                ← write_batch() bulk Parquet writer
-│   │   ├── 01_ingest_tickers_exchange.py   ← 1 HTTP call, 1 Parquet file
-│   │   ├── 02_ingest_submissions.py        ← bulk: 8 workers, batch Parquet
-│   │   ├── 03_ingest_companyfacts.py       ← bulk: 8 workers, batch Parquet
-│   │   ├── 04_load_bronze_delta.py         ← COPY INTO all batches → Delta
-│   │   └── 05_verify_bronze_complete.py    ← GATE: asserts row counts > 0
+│   │   ├── _batch_writer.py                ← write_batch() via fsspec (s3fs or adlfs)
+│   │   ├── 01_ingest_tickers_exchange.py   ← 1 HTTP call → data.parquet in S3/Azure
+│   │   ├── 02_ingest_submissions.py        ← 8 workers → batch_NNNN.parquet in S3/Azure
+│   │   ├── 03_ingest_companyfacts.py       ← 8 workers → batch_NNNN.parquet in S3/Azure
+│   │   └── bronze_gate.py                  ← asserts Parquet file count > 0 (raises on failure)
 │   ├── bronze_to_silver/
-│   │   ├── 01_silver_dim_security.py       ← Databricks notebook/PySpark
-│   │   └── 02_silver_filings_and_facts.py
+│   │   ├── 01_silver_dim_security.py       ← DuckDB in-memory: bronze → silver/dim_security/
+│   │   └── 02_silver_filings_and_facts.py  ← DuckDB in-memory: bronze → silver/filings_index/ + financial_facts/ + corporate_actions/
 │   └── silver_to_gold/
-│       └── 01_build_gold.py
+│       └── 01_build_gold.py                ← DuckDB in-memory: silver → gold/ (5 tables)
 ├── workflows/
-│   └── sec_edgar_daily.yml                 ← Databricks Asset Bundle workflow
-├── tests/
-│   └── test_spot_check.py                  ← verification queries
-└── README.md
+│   ├── adf_pipeline.json                   ← Azure: ADF Custom Activity pipeline
+│   ├── adf_linked_services.json            ← Azure: Batch + Storage linked service definitions
+│   ├── adf_trigger.json                    ← Azure: Tumbling Window Trigger (daily 06:00 UTC)
+│   ├── step_functions_definition.json      ← AWS: Step Functions state machine ASL
+│   ├── ecs_task_definition.json            ← AWS: ECS task definition (taskRoleArn, awsvpc, resources)
+│   └── iam_task_role_policy.json           ← AWS: S3 read/write IAM policy
+└── tests/
+    └── test_spot_check.py                  ← DuckDB queries over S3/Azure Parquet for verification
 ```
+
+**No `scripts/setup/` SQL files** — there is no database to initialize. Parquet directories are created automatically by the first write.
 
 ---
 
 ## 14. Verification Steps
 
-### Step 1 — Unity Catalog setup
-```sql
--- Run in Databricks SQL editor
-SHOW SCHEMAS IN sec_edgar_platform;
--- Expected: bronze, silver, gold
-```
+All verification uses DuckDB reading Parquet directly from S3/Azure — no database connection needed.
 
-### Step 2 — DDL tables created
-```sql
-SHOW TABLES IN sec_edgar_platform.bronze;
-SHOW TABLES IN sec_edgar_platform.silver;
-SHOW TABLES IN sec_edgar_platform.gold;
-```
-
-### Step 3 — Smoke test ingestion (5 CIKs)
+### Step 1 — Storage access
 ```bash
-# Run locally or on a Databricks single-node cluster
+# AWS
+aws s3 ls s3://{BUCKET}/{PREFIX}/
+# Expected: no error
+
+# Azure
+az storage blob list --container-name sec-edgar --account-name myaccount --prefix sec-edgar/
+```
+
+### Step 2 — Smoke test ingestion (local, 5 CIKs)
+```bash
+export CLOUD_PROVIDER=aws   # or azure
+export AWS_BUCKET=my-bucket  # or AZURE_STORAGE_ACCOUNT / AZURE_CONTAINER
+
 python scripts/ingest/01_ingest_tickers_exchange.py
-# Expected: Parquet written to {STORAGE_ROOT}/bronze/company_tickers_exchange/ingestion_date=<today>/
+# Expected: data.parquet written to {STORAGE_ROOT}/bronze/company_tickers_exchange/ingestion_date=<today>/
 
-# Check row count
-python -c "import pyarrow.parquet as pq; t = pq.read_table('{STORAGE_ROOT}/bronze/company_tickers_exchange/ingestion_date=<today>/data.parquet'); print(len(t))"
-# Expected: ~10,000–12,000 rows
+python scripts/ingest/02_ingest_submissions.py --date today --limit 5
+python scripts/ingest/03_ingest_companyfacts.py --date today --limit 5
 ```
 
-### Step 4 — Bronze Delta tables loaded
-```sql
-SELECT ingestion_date, COUNT(*) AS rows
-FROM sec_edgar_platform.bronze.company_tickers_exchange_raw
-GROUP BY ingestion_date ORDER BY ingestion_date DESC LIMIT 5;
+### Step 3 — Verify bronze Parquet
+```python
+import duckdb
+conn = duckdb.connect()
+conn.execute("LOAD httpfs; SET s3_region='us-east-1';")  # or LOAD azure;
+
+# Tickers
+print(conn.execute("""
+  SELECT COUNT(*), MIN(ingestion_date), MAX(ingestion_date)
+  FROM read_parquet('s3://my-bucket/sec-edgar/bronze/company_tickers_exchange/*/*.parquet',
+                    hive_partitioning=true)
+""").fetchone())
+# Expected: (10000+, 'today', 'today')
 ```
 
-### Step 5 — Silver security master populated
-```sql
-SELECT COUNT(*) AS total_securities,
-       SUM(CASE WHEN active_flag THEN 1 ELSE 0 END) AS active
-FROM sec_edgar_platform.silver.dim_security;
--- Expected: ~6,000–8,000 active (NYSE + Nasdaq)
+### Step 4 — Silver security master
+```python
+print(conn.execute("""
+  SELECT COUNT(*) AS total,
+         SUM(CASE WHEN active_flag THEN 1 ELSE 0 END) AS active
+  FROM read_parquet('s3://my-bucket/sec-edgar/silver/dim_security/*/*.parquet',
+                    hive_partitioning=true)
+""").fetchone())
+# Expected: (6000+, 6000+) — NYSE + Nasdaq only
 ```
 
-### Step 6 — Spot check known tickers
-```sql
--- AAPL, MSFT, TSLA, JPM should all exist with recent financial facts
-SELECT s.ticker, s.company_name, f.period_end, f.revenues, f.net_income
-FROM sec_edgar_platform.silver.dim_security s
-JOIN sec_edgar_platform.silver.financial_facts f ON s.security_id = f.security_id
-WHERE s.ticker IN ('AAPL', 'MSFT', 'TSLA', 'JPM')
-  AND f.form_type = '10-K'
-ORDER BY s.ticker, f.period_end DESC;
+### Step 5 — Spot check known tickers
+```python
+print(conn.execute("""
+  SELECT s.ticker, s.company_name, f.period_end, f.revenues, f.net_income
+  FROM read_parquet('.../silver/dim_security/*/*.parquet') s
+  JOIN read_parquet('.../silver/financial_facts/*/*.parquet') f
+    ON s.security_id = f.security_id
+  WHERE s.ticker IN ('AAPL', 'MSFT', 'TSLA', 'JPM')
+    AND f.form_type = '10-K'
+  ORDER BY s.ticker, f.period_end DESC
+""").df())
 ```
 
-### Step 7 — Gold tables ready
-```sql
-SELECT ticker, fiscal_year, revenues, net_margin, return_on_equity
-FROM sec_edgar_platform.gold.financial_statements_annual
-WHERE ticker IN ('AAPL', 'MSFT')
-ORDER BY ticker, fiscal_year DESC;
+### Step 6 — Gold tables ready
+```python
+print(conn.execute("""
+  SELECT ticker, fiscal_year, revenues, net_margin, return_on_equity
+  FROM read_parquet('.../gold/financial_statements_annual/*/*.parquet')
+  WHERE ticker IN ('AAPL', 'MSFT')
+  ORDER BY ticker, fiscal_year DESC
+""").df())
 ```
 
-### Step 8 — Full pipeline run
+### Step 7 — Full pipeline run
 ```bash
-databricks bundle deploy --target prod
-databricks bundle run sec_edgar_daily
-# Monitor in Databricks Jobs UI
+# Local
+python pipeline.py
+
+# AWS (trigger Step Functions manually)
+aws stepfunctions start-execution \
+  --state-machine-arn arn:aws:states:{region}:{account}:stateMachine:sec-edgar-daily \
+  --input '{"ingestDate": "2024-01-25", "subnets": ["subnet-xxx"], "securityGroups": ["sg-xxx"]}'
+
+# Azure (trigger ADF pipeline manually)
+az datafactory pipeline create-run \
+  --factory-name my-adf --resource-group my-rg \
+  --pipeline-name sec_edgar_daily \
+  --parameters '{"ingestDate": "2024-01-25", "storageAccount": "myaccount"}'
 # Expected runtime: ~60–90 min for full initial load of ~8,000 companies
 ```
 
-### Step 9 — Idempotency check
-Re-run the pipeline for the same date. Row counts in Silver/Gold should be identical (MERGE is idempotent). Bronze will skip (parquet files already exist).
+### Step 8 — Idempotency check
+Re-run the pipeline for the same date. Silver/Gold Parquet files are overwritten with identical content (same row counts). Bronze skips files that already exist.
 
 ---
 
@@ -1296,125 +1205,95 @@ Re-run the pipeline for the same date. Row counts in Silver/Gold should be ident
 | Multi-class shares (BRK.A/BRK.B) | Both share same CIK; `ticker_class` differentiates; both get separate `security_id` |
 | HTTP 429 rate limit | Sleep 60s, retry up to 3× with exponential backoff |
 | `submissions.filings.files` pagination | Fetch continuation pages, cap at 5 pages per CIK |
-| Delta schema mismatch | Use `mergeSchema = false` on Bronze append; fail loudly if schema changed upstream |
-| SEC site maintenance (weekends) | Pipeline is idempotent — next run will backfill missing date |
-| Large companyfacts payload (>10 MB) | Store as-is in Parquet STRING column; parse in Silver job where Spark has memory |
+| SEC rate limit across tasks | Ingest tasks run **sequentially** — each uses ≤8 req/s; never exceed 10 req/s total |
+| DuckDB extensions in VPC | Extensions are pre-installed in the Dockerfile — no runtime internet download needed |
+| DuckDB S3 auth (ECS) | Credentials come from ECS task IAM role via instance metadata — no env vars needed |
+| DuckDB Azure auth (Batch) | Set `AZURE_CLIENT_ID` env var; `DefaultAzureCredential` picks up Managed Identity |
+| SEC site maintenance (weekends) | Pipeline is idempotent — next run rewrites today's Silver/Gold Parquet |
+| Large companyfacts payload (>10 MB) | Store as-is in Parquet STRING column; DuckDB parses JSON in Silver transform |
+| ADF Batch pool node unavailable | ADF retries automatically; Batch scales pool nodes up/down |
+| ECS Fargate task fails | Step Functions retry policy (`MaxAttempts: 2`) automatically retries failed states |
 
 ---
 
 ## 16. How to Start Coding (Post-Review Checklist)
 
-Once you have reviewed this spec and are ready to implement, follow these steps in order. Each step is independent and testable before moving to the next.
+Once you have reviewed this spec and are ready to implement, follow these steps in order. Each step is independently testable.
 
 ### Phase 0 — Environment Setup (Do Once)
 
-- [ ] **Create a Databricks workspace** (any cloud). Enable Unity Catalog.
-- [ ] **Provision object storage** (S3 bucket / ADLS container / GCS bucket). Note the root path.
-- [ ] **Edit `config/settings.py`** — set `STORAGE_ROOT`, `USER_AGENT`, `CATALOG_NAME`.
-- [ ] **Create Python virtual environment** for the ingestion driver:
+- [ ] **Choose cloud**: set `CLOUD_PROVIDER=aws` or `CLOUD_PROVIDER=azure` as an env var.
+- [ ] **Provision storage** (Section 5): create S3 bucket or ADLS Gen2 storage account + container.
+- [ ] **Configure credentials** locally:
+  - AWS: `aws configure` or set `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` + `AWS_DEFAULT_REGION`
+  - Azure: `az login` (DefaultAzureCredential picks it up) + set `AZURE_STORAGE_ACCOUNT` / `AZURE_CONTAINER`
+- [ ] **Create Python virtual environment**:
   ```bash
   python -m venv .venv && source .venv/bin/activate
-  pip install requests pyarrow pandas
+  pip install -r requirements.txt
   ```
-- [ ] **Configure cloud credentials** in the environment (AWS profile / ADLS SAS / GCS service account) so `pyarrow` can write to `STORAGE_ROOT`.
-- [ ] **Install Databricks CLI** and authenticate: `databricks auth login`.
+- [ ] **No database to set up.** There is no DDL to run. Parquet directories are created automatically.
 
 ### Phase 1 — Create the Project Scaffold
 
-Create the directory structure from Section 13:
 ```bash
-mkdir -p config scripts/{setup,ingest,bronze_to_silver,silver_to_gold} workflows tests
-touch config/settings.py
+mkdir -p config scripts/{ingest,bronze_to_silver,silver_to_gold} workflows tests
+touch config/__init__.py config/settings.py
 ```
 
 Copy the settings template from **Section 4** into `config/settings.py` and fill in your values.
 
-**First file to write:** `config/settings.py`
+### Phase 2 — Write and Test the Ingestion Scripts
 
-### Phase 2 — Run the DDL (Unity Catalog + Tables)
-
-1. Open a Databricks SQL editor or notebook.
-2. Run `scripts/setup/00_unity_catalog_setup.sql` — creates catalog + schemas + storage location. Content: **Section 5**.
-3. Run `scripts/setup/01_create_bronze_tables.sql` — all Bronze DDL. Content: **Section 7**.
-4. Run `scripts/setup/02_create_silver_tables.sql` — all Silver DDL. Content: **Section 8**.
-5. Run `scripts/setup/03_create_gold_tables.sql` — all Gold DDL. Content: **Section 9**.
-
-**Verify:** `SHOW TABLES IN sec_edgar_platform.bronze;` returns 4 tables.
-
-### Phase 3 — Write and Test the Ingestion Scripts
-
-Write scripts in this order (each can be tested independently):
-
-1. **`scripts/ingest/01_ingest_tickers_exchange.py`** (Section 11.1)
-   - Test: `python scripts/ingest/01_ingest_tickers_exchange.py`
-   - Expected: Parquet written to `{STORAGE_ROOT}/bronze/company_tickers_exchange/ingestion_date=<today>/data.parquet`
+1. **`scripts/ingest/_rate_limiter.py`** — Section 11.0
+2. **`scripts/ingest/_http.py`** — Section 11.0
+3. **`scripts/ingest/_batch_writer.py`** — Section 11.0 (updated with fsspec/s3fs/adlfs)
+4. **`scripts/ingest/01_ingest_tickers_exchange.py`** — Section 11.1
+   - Test: `INGEST_DATE=2024-01-25 python scripts/ingest/01_ingest_tickers_exchange.py`
+   - Verify: Parquet appears in `{STORAGE_ROOT}/bronze/company_tickers_exchange/ingestion_date=2024-01-25/`
    - Check row count ≈ 10,000–12,000
+5. **`scripts/ingest/02_ingest_submissions.py`** — Section 11.2
+   - Dev test: `--limit 5` flag
+6. **`scripts/ingest/03_ingest_companyfacts.py`** — Section 11.3
+   - Dev test: `--limit 5`; AAPL (CIK 320193) is a good stress test for large payload
 
-2. **`scripts/ingest/02_ingest_submissions.py`** (Section 11.2)
-   - Test with 5 CIKs first: add a `--limit 5` flag during development
-   - Expected: 5 Parquet files under `{STORAGE_ROOT}/bronze/submissions/ingestion_date=<today>/`
+### Phase 3 — Write Silver Transforms (DuckDB)
 
-3. **`scripts/ingest/03_ingest_companyfacts.py`** (Section 11.3)
-   - Same pattern as submissions
-   - Test with AAPL CIK (320193) first — it's a large payload, good stress test
+1. **`scripts/bronze_to_silver/01_silver_dim_security.py`** — Section 11.4
+   - The `security_id` hash is the most critical piece — test it with known CIKs first (Section 8.1)
+   - Verify: DuckDB `SELECT COUNT(*) FROM read_parquet('.../silver/dim_security/.../data.parquet')`
 
-### Phase 4 — Load Bronze Delta Tables
+2. **`scripts/bronze_to_silver/02_silver_filings_and_facts.py`** — Section 11.5
+   - Start with `filings_index` (simpler JSON parsing), then add `financial_facts`
+   - Key complexity: unnesting parallel arrays from `filings_recent_json` and XBRL concept extraction
 
-After each ingestion script, load the Parquet files into the Bronze Delta tables. Write a Databricks notebook for each (or add a `load_bronze()` function to each ingest script):
+### Phase 4 — Write Gold Transforms (DuckDB)
 
-```python
-# Example: load tickers into Bronze
-spark.read.parquet(f"{STORAGE_ROOT}/bronze/company_tickers_exchange/ingestion_date={today}/") \
-    .write.format("delta").mode("append") \
-    .saveAsTable("sec_edgar_platform.bronze.company_tickers_exchange_raw")
-```
+**`scripts/silver_to_gold/01_build_gold.py`** — Section 11.6
 
-**Verify:** `SELECT COUNT(*) FROM sec_edgar_platform.bronze.company_tickers_exchange_raw;`
+Start with `financial_statements_annual` (highest value). Each gold table is a single DuckDB `COPY ... TO` with a `SELECT ... JOIN` of silver Parquet.
 
-### Phase 5 — Write Silver Transforms (Databricks Notebooks)
+### Phase 5 — Wire Up Cloud Orchestration
 
-Write in order:
+**Azure:** Create `workflows/adf_pipeline.json` (Section 12.2). Deploy via ADF portal or ARM deployment.
 
-1. **`scripts/bronze_to_silver/01_silver_dim_security.py`** (Section 11.4)
-   - The `security_id` generation logic is the most critical piece — test it with known CIKs
-   - Verify: AAPL, MSFT, TSLA all have rows in `silver.dim_security`
+**AWS:** Create `workflows/step_functions_definition.json` and `workflows/ecs_task_definition.json` (Section 12.3). Deploy via `aws cloudformation` or Terraform.
 
-2. **`scripts/bronze_to_silver/02_silver_filings_and_facts.py`** (Section 11.5)
-   - Start with just `filings_index` (simpler parsing), then add `financial_facts`
-   - Key complexity: parsing parallel arrays from `filings.recent` JSON and XBRL concept extraction
-   - Verify: `SELECT * FROM silver.financial_facts WHERE cik = 320193 AND form_type = '10-K' ORDER BY period_end DESC LIMIT 5`
+### Phase 6 — Full Verification
 
-### Phase 6 — Write Gold Transforms
-
-**`scripts/silver_to_gold/01_build_gold.py`** (Section 11.6)
-
-The Gold layer is entirely SQL `CREATE OR REPLACE TABLE ... AS SELECT`. Write one statement per Gold table. Start with `financial_statements_annual` — it's the most valuable for analytics.
-
-**Verify:** `SELECT ticker, fiscal_year, revenues, net_margin FROM gold.financial_statements_annual WHERE ticker = 'AAPL' ORDER BY fiscal_year DESC LIMIT 5`
-
-### Phase 7 — Wire Up the Databricks Workflow
-
-1. Create `workflows/sec_edgar_daily.yml` from **Section 12**.
-2. Update `node_type_id` to match your cloud's available instance types.
-3. Deploy: `databricks bundle deploy --target dev`
-4. Run manually: `databricks bundle run sec_edgar_daily`
-5. Monitor in the Databricks Jobs UI.
-
-### Phase 8 — Full Verification
-
-Run all verification queries from **Section 14** in order. The final check is the idempotency test (Step 9).
+Run all verification steps from **Section 14** in order.
 
 ---
 
-### Implementation Priority (if you want to deliver value incrementally)
+### Implementation Priority (deliver value incrementally)
 
 | Priority | Deliverable | Sections |
 |---|---|---|
-| 1 (highest) | Bronze tickers + `silver.dim_security` | 7.1, 8.1, 8.2, 11.1, 11.4 |
-| 2 | Bronze submissions + `silver.filings_index` | 7.2, 8.4, 11.2 |
-| 3 | Bronze companyfacts + `silver.financial_facts` | 7.3, 8.5, 11.3, 11.5 |
+| 1 (highest) | Bronze tickers + silver `dim_security` | 6, 7.1, 8.1, 11.1–11.4 |
+| 2 | Bronze submissions + silver `filings_index` | 7.2, 8.2, 11.2 |
+| 3 | Bronze companyfacts + silver `financial_facts` | 7.3, 8.3, 11.3, 11.5 |
 | 4 | Gold annual financials | 9.1, 11.6 |
 | 5 | Gold quarterly + company profile + corporate events | 9.2–9.5 |
-| 6 | Databricks Workflow automation | 12 |
+| 6 | Cloud orchestration (ADF or Step Functions) | 12 |
 
 **Start with Priority 1.** You'll have a queryable security master with `security_id` before writing a single financial fact row.
