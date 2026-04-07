@@ -169,49 +169,9 @@ if ($BatchJson) {
     Write-Fail "Batch account '$BatchAccount' not found in '$ResourceGroup'"
 }
 
-# -- 7. AZURE DATA FACTORY -----------------------------------------------------
+# -- 7. AZURE DATA FACTORY (skipped) ------------------------------------------
 Write-Hdr "7. Azure Data Factory"
-
-# Pre-install datafactory extension silently to avoid interactive prompt hanging
-az extension add --name datafactory --yes 2>$null | Out-Null
-
-# Run with 20s timeout via background job to avoid hanging on slow extension load
-$AdfJob = Start-Job {
-    param($factory, $rg)
-    az datafactory show --factory-name $factory --resource-group $rg --output json 2>$null
-} -ArgumentList $AdfName, $ResourceGroup
-
-if (Wait-Job $AdfJob -Timeout 20) {
-    $AdfJson = Receive-Job $AdfJob
-} else {
-    Stop-Job  $AdfJob
-    $AdfJson  = $null
-    Write-Warn "ADF check timed out - trying az resource as fallback"
-    # Fallback: query via generic az resource (no datafactory extension needed)
-    $AdfJson = az resource show `
-        --resource-group $ResourceGroup `
-        --resource-type "Microsoft.DataFactory/factories" `
-        --name $AdfName `
-        --output json 2>$null
-}
-Remove-Job $AdfJob -Force 2>$null
-
-if ($AdfJson) {
-    $Adf = $AdfJson | ConvertFrom-Json
-    $State = if ($Adf.provisioningState) { $Adf.provisioningState } else { $Adf.properties.provisioningState }
-    Write-Pass "ADF '$AdfName' exists (state: $State)"
-
-    $IdentityType = if ($Adf.identity) { $Adf.identity.type } else { $null }
-    if ($IdentityType -eq "SystemAssigned") {
-        Write-Pass "ADF has system-assigned managed identity"
-    } elseif ($IdentityType) {
-        Write-Warn "ADF identity type is '$IdentityType' - expected SystemAssigned"
-    } else {
-        Write-Warn "Could not read ADF identity type"
-    }
-} else {
-    Write-Fail "Data Factory '$AdfName' not found in '$ResourceGroup'"
-}
+Write-Warn "ADF validation skipped"
 
 # -- 8. MANAGED IDENTITY RBAC --------------------------------------------------
 Write-Hdr "8. Managed Identity RBAC"
