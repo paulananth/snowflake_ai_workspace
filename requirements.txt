@@ -1,0 +1,13 @@
+# Phase 1 — SEC EDGAR standalone test (no cloud deps)
+requests>=2.31.0
+pyarrow>=14.0.0
+
+# Phase 2 — Azure Bronze ingest
+adlfs>=2024.2.0          # fsspec filesystem for Azure Data Lake Storage Gen2
+azure-identity>=1.15.0   # DefaultAzureCredential (Managed Identity, az login, service principal)
+
+# Phase 2 — AWS Bronze ingest (optional, inert if unused)
+s3fs>=2024.2.0
+
+# DuckDB — stateless transforms + local verification
+duckdb>=1.0.0
