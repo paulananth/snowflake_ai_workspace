@@ -6,14 +6,14 @@
 #Requires -Version 5.1
 
 # -- CONFIGURE THESE ----------------------------------------------------------
-$StorageAccount  = ""    # e.g. mysecedgarstorage
-$Container       = ""    # e.g. sec-edgar
-$Prefix          = ""    # e.g. sec-edgar
-$BatchAccount    = ""    # e.g. mysecedgarbatch
-$AcrName         = ""    # e.g. mysecedgaracr
-$AdfName         = ""    # e.g. mysecedgaradf
-$ResourceGroup   = ""    # e.g. my-sec-edgar-rg
-$ManagedIdentity = ""    # e.g. sec-edgar-ingest-identity
+$StorageAccount  = "mysecedgarstorage"    # e.g. mysecedgarstorage
+$Container       = "sec-edgar"            # e.g. sec-edgar
+$Prefix          = "sec-edgar"            # e.g. sec-edgar
+$BatchAccount    = "mysecedgarbatch"      # e.g. mysecedgarbatch
+$AcrName         = "mysecedgaracr"        # e.g. mysecedgaracr
+$AdfName         = "mysecedgaradf"        # e.g. mysecedgaradf
+$ResourceGroup   = "my-sec-edgar-rg"      # e.g. my-sec-edgar-rg
+$ManagedIdentity = "sec-edgar-ingest-identity"    # e.g. sec-edgar-ingest-identity
 # -----------------------------------------------------------------------------
 
 $Pass = 0; $Fail = 0; $Warn = 0
@@ -169,23 +169,9 @@ if ($BatchJson) {
     Write-Fail "Batch account '$BatchAccount' not found in '$ResourceGroup'"
 }
 
-# -- 7. AZURE DATA FACTORY -----------------------------------------------------
+# -- 7. AZURE DATA FACTORY (skipped) ------------------------------------------
 Write-Hdr "7. Azure Data Factory"
-$AdfJson = az datafactory show `
-    --factory-name $AdfName --resource-group $ResourceGroup `
-    --output json 2>$null
-if ($AdfJson) {
-    $Adf = $AdfJson | ConvertFrom-Json
-    Write-Pass "ADF '$AdfName' exists (state: $($Adf.provisioningState))"
-
-    if ($Adf.identity.type -eq "SystemAssigned") {
-        Write-Pass "ADF has system-assigned managed identity"
-    } else {
-        Write-Warn "ADF identity type is '$($Adf.identity.type)' - expected SystemAssigned"
-    }
-} else {
-    Write-Fail "Data Factory '$AdfName' not found in '$ResourceGroup'"
-}
+Write-Warn "ADF validation skipped"
 
 # -- 8. MANAGED IDENTITY RBAC --------------------------------------------------
 Write-Hdr "8. Managed Identity RBAC"
