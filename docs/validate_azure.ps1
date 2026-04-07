@@ -171,17 +171,43 @@ if ($BatchJson) {
 
 # -- 7. AZURE DATA FACTORY -----------------------------------------------------
 Write-Hdr "7. Azure Data Factory"
-$AdfJson = az datafactory show `
-    --factory-name $AdfName --resource-group $ResourceGroup `
-    --output json 2>$null
+
+# Pre-install datafactory extension silently to avoid interactive prompt hanging
+az extension add --name datafactory --yes 2>$null | Out-Null
+
+# Run with 20s timeout via background job to avoid hanging on slow extension load
+$AdfJob = Start-Job {
+    param($factory, $rg)
+    az datafactory show --factory-name $factory --resource-group $rg --output json 2>$null
+} -ArgumentList $AdfName, $ResourceGroup
+
+if (Wait-Job $AdfJob -Timeout 20) {
+    $AdfJson = Receive-Job $AdfJob
+} else {
+    Stop-Job  $AdfJob
+    $AdfJson  = $null
+    Write-Warn "ADF check timed out - trying az resource as fallback"
+    # Fallback: query via generic az resource (no datafactory extension needed)
+    $AdfJson = az resource show `
+        --resource-group $ResourceGroup `
+        --resource-type "Microsoft.DataFactory/factories" `
+        --name $AdfName `
+        --output json 2>$null
+}
+Remove-Job $AdfJob -Force 2>$null
+
 if ($AdfJson) {
     $Adf = $AdfJson | ConvertFrom-Json
-    Write-Pass "ADF '$AdfName' exists (state: $($Adf.provisioningState))"
+    $State = if ($Adf.provisioningState) { $Adf.provisioningState } else { $Adf.properties.provisioningState }
+    Write-Pass "ADF '$AdfName' exists (state: $State)"
 
-    if ($Adf.identity.type -eq "SystemAssigned") {
+    $IdentityType = if ($Adf.identity) { $Adf.identity.type } else { $null }
+    if ($IdentityType -eq "SystemAssigned") {
         Write-Pass "ADF has system-assigned managed identity"
+    } elseif ($IdentityType) {
+        Write-Warn "ADF identity type is '$IdentityType' - expected SystemAssigned"
     } else {
-        Write-Warn "ADF identity type is '$($Adf.identity.type)' - expected SystemAssigned"
+        Write-Warn "Could not read ADF identity type"
     }
 } else {
     Write-Fail "Data Factory '$AdfName' not found in '$ResourceGroup'"
