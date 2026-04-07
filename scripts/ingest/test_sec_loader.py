@@ -23,6 +23,7 @@ import os
 import pathlib
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import date
 
 import pyarrow as pa
@@ -242,13 +243,17 @@ FACTS_SCHEMA = pa.schema([
     pa.field("label",        pa.string()),
     pa.field("unit",         pa.string()),
     pa.field("end_date",     pa.string()),
-    pa.field("value",        pa.float64()),
+    pa.field("value",        pa.decimal128(38, 4)),
     pa.field("accn",         pa.string()),
     pa.field("form",         pa.string()),
     pa.field("filed",        pa.string()),
     pa.field("period_type",  pa.string()),   # "annual" | "quarterly" | "instant"
     pa.field("ingestion_date", pa.string()),
 ])
+
+
+def _to_decimal_38_4(value: object) -> Decimal:
+    return Decimal(str(value)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
 
 
 def _period_type(entry: dict) -> str:
@@ -291,7 +296,7 @@ def _parse_facts(cik10: str, ticker: str, data: dict) -> list[dict]:
                         "label":         label,
                         "unit":          unit_key,
                         "end_date":      entry.get("end", ""),
-                        "value":         float(entry.get("val", 0)),
+                        "value":         _to_decimal_38_4(entry.get("val", 0)),
                         "accn":          entry.get("accn", ""),
                         "form":          entry.get("form", ""),
                         "filed":         entry.get("filed", ""),

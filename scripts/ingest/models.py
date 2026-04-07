@@ -11,13 +11,16 @@ References:
 """
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Optional
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 # ── Submissions ───────────────────────────────────────────────────────────────
 
 class Address(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     street1:                    Optional[str] = None
     street2:                    Optional[str] = None
     city:                       Optional[str] = None
@@ -25,13 +28,29 @@ class Address(BaseModel):
     zipCode:                    Optional[str] = None
     stateOrCountryDescription:  Optional[str] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_country_code(cls, data: object) -> object:
+        if isinstance(data, dict):
+            data = dict(data)
+            data.pop("countryCode", None)
+        return data
+
 
 class FormerName(BaseModel):
-    name: str
-    date: str
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    # SEC submissions currently return formerNames entries with "name", "from", and "to".
+    # Keep all of them nullable so sparse historical records still validate.
+    name: Optional[str] = None
+    from_: Optional[str] = Field(default=None, alias="from")
+    to: Optional[str] = None
+    date: Optional[str] = None
 
 
 class Filing(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     """One row from the filings.recent columnar arrays."""
     accessionNumber:        str
     filingDate:             str
@@ -42,22 +61,62 @@ class Filing(BaseModel):
     fileNumber:             Optional[str] = None
     filmNumber:             Optional[str] = None
     items:                  Optional[str] = None
+    core_type:              Optional[str] = None
     size:                   Optional[int] = None
     isXBRL:                 Optional[int] = None
+    isXBRLNumeric:          Optional[int] = None
     isInlineXBRL:           Optional[int] = None
     primaryDocument:        Optional[str] = None
     primaryDocDescription:  Optional[str] = None
 
 
 class FilingsFile(BaseModel):
+    model_config = ConfigDict(extra="allow")
     """Entry in filings.files — pointer to an older submissions batch."""
     name:         str
     filingCount:  int
-    filingFrom:   str
-    filingTo:     str
+    filingFrom:   Optional[str] = None
+    filingTo:     Optional[str] = None
+
+
+class RecentFilings(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    accessionNumber:        list[str] = Field(default_factory=list)
+    filingDate:             list[str] = Field(default_factory=list)
+    reportDate:             list[Optional[str]] = Field(default_factory=list)
+    acceptanceDateTime:     list[Optional[str]] = Field(default_factory=list)
+    act:                    list[Optional[str]] = Field(default_factory=list)
+    form:                   list[str] = Field(default_factory=list)
+    fileNumber:             list[Optional[str]] = Field(default_factory=list)
+    filmNumber:             list[Optional[str]] = Field(default_factory=list)
+    items:                  list[Optional[str]] = Field(default_factory=list)
+    core_type:              list[Optional[str]] = Field(default_factory=list)
+    size:                   list[Optional[int]] = Field(default_factory=list)
+    isXBRL:                 list[Optional[int]] = Field(default_factory=list)
+    isXBRLNumeric:          list[Optional[int]] = Field(default_factory=list)
+    isInlineXBRL:           list[Optional[int]] = Field(default_factory=list)
+    primaryDocument:        list[Optional[str]] = Field(default_factory=list)
+    primaryDocDescription:  list[Optional[str]] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_parallel_array_lengths(self) -> RecentFilings:
+        lengths = {field: len(value) for field, value in self.model_dump().items() if value}
+        if lengths and len(set(lengths.values())) != 1:
+            raise ValueError(f"filings.recent arrays must have matching lengths, got {lengths}")
+        return self
+
+
+class Filings(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    recent: Optional[RecentFilings] = None
+    files: list[FilingsFile] = Field(default_factory=list)
 
 
 class Submission(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     """
     Full company submission record from SEC EDGAR.
     Maps every top-level field returned by the submissions endpoint.
@@ -67,12 +126,14 @@ class Submission(BaseModel):
     entityType:                         Optional[str] = None
     sic:                                Optional[str] = None
     sicDescription:                     Optional[str] = None
+    ownerOrg:                           Optional[str] = None
     insiderTransactionForOwnerExists:   Optional[int] = None
     insiderTransactionForIssuerExists:  Optional[int] = None
     name:                               str
-    tickers:                            list[str] = []
-    exchanges:                          list[str] = []
+    tickers:                            list[str] = Field(default_factory=list)
+    exchanges:                          list[str] = Field(default_factory=list)
     ein:                                Optional[str] = None
+    lei:                                Optional[str] = None
     description:                        Optional[str] = None
     website:                            Optional[str] = None
     investorWebsite:                    Optional[str] = None
@@ -82,22 +143,27 @@ class Submission(BaseModel):
     stateOfIncorporationDescription:    Optional[str] = None
     phone:                              Optional[str] = None
     flags:                              Optional[str] = None
-    formerNames:                        list[FormerName] = []
+    formerNames:                        list[FormerName] = Field(default_factory=list)
     addresses:                          Optional[dict[str, Address]] = None
-    filing_files:                       list[FilingsFile] = []
+    filings_recent:                     Optional[RecentFilings] = Field(default=None, exclude=True)
+    filing_files:                       list[FilingsFile] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
-    def _extract_filing_files(cls, data: dict) -> dict:
-        """Pull filings.files up to top-level before validation."""
-        filings = data.get("filings") or {}
-        data["filing_files"] = filings.get("files") or []
+    def _extract_filing_data(cls, data: dict) -> dict:
+        """Validate nested filings payload, then lift the pieces we keep on the model."""
+        data = dict(data)
+        filings_raw = data.pop("filings", None) or {}
+        filings = Filings.model_validate(filings_raw)
+        data["filings_recent"] = filings.recent
+        data["filing_files"] = filings.files
         return data
 
 
 # ── CompanyFacts ──────────────────────────────────────────────────────────────
 
 class FactEntry(BaseModel):
+    model_config = ConfigDict(extra="allow")
     """
     One tagged value from an XBRL filing.
     start is absent for instant facts (balance sheet items at a point in time).
@@ -106,20 +172,22 @@ class FactEntry(BaseModel):
     accn:   str
     end:    str
     start:  Optional[str] = None   # absent for instant facts
-    val:    float
+    val:    Decimal
     form:   str
     filed:  str
     frame:  Optional[str] = None   # e.g. "CY2023", "CY2023Q3I", "CY2023Q3"
 
 
 class ConceptData(BaseModel):
+    model_config = ConfigDict(extra="allow")
     """All reported values for one XBRL concept (e.g. us-gaap/Revenues)."""
-    label:        str
+    label:        Optional[str] = None
     description:  Optional[str] = None
     units:        dict[str, list[FactEntry]]   # unit → entries, e.g. "USD" → [...]
 
 
 class CompanyFacts(BaseModel):
+    model_config = ConfigDict(extra="allow")
     """
     Full XBRL company facts response.
     facts is a nested dict: namespace → concept_name → ConceptData.
@@ -148,7 +216,6 @@ def explode_filings(cik10: str, recent: dict) -> list[dict]:
     rows = []
     for vals in zip(*recent.values()):
         row = dict(zip(keys, vals))
-        row["cik"] = cik10
         filing = Filing.model_validate(row)
         d = filing.model_dump()
         d["cik"] = cik10
