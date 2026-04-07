@@ -9,6 +9,7 @@ dependencies = [
     "pyarrow>=14.0.0",
     "pandas>=2.0.0",
     "duckdb>=1.0.0",
+    "pydantic>=2.0.0",
     # Phase 2 -- Azure Bronze ingest
     "adlfs>=2024.2.0",
     "azure-identity>=1.15.0",
