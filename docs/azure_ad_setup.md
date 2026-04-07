@@ -4,13 +4,33 @@ Step-by-step guide to create managed identities, role-based access control (RBAC
 
 ---
 
+## Estimated Monthly Cost
+
+| Resource | SKU / Config | Est. Cost/month |
+|---|---|---|
+| Azure Data Lake Storage Gen2 | Standard LRS, ~15 GB, Hot → Cool lifecycle | ~$0.40 |
+| Azure Batch compute | Low-priority `Standard_D2s_v3`, ~90 min/day, scale-to-zero | ~$0.85 |
+| Azure Container Registry | Basic tier | ~$5.00 |
+| Azure Data Factory | ~8 activity runs/day | ~$0.25 |
+| Azure Batch account | (no charge for account itself) | $0.00 |
+| **Total** | | **~$6.50/month** |
+
+**Key cost levers used in this guide:**
+- Low-priority Batch nodes (80% cheaper than dedicated)
+- Pool auto-scales to **0 nodes when idle** — no idle compute charge
+- `Standard_D2s_v3` (2 vCPU) instead of D4s_v3 — tasks run sequentially, not in parallel
+- Storage lifecycle policy moves Bronze Parquet older than 30 days to Cool tier (~50% cheaper storage)
+- ACR Basic is the cheapest registry tier
+
+---
+
 ## Prerequisites
 
 - Azure subscription with Owner or User Access Administrator + Contributor rights
 - Azure CLI installed and authenticated: `az login`
 - Decisions made:
   - Resource group name (replace `{RG}` throughout)
-  - Azure region (replace `{LOCATION}` — e.g. `eastus`)
+  - Azure region (replace `{LOCATION}` — `eastus` or `westus2` are typically cheapest)
   - Storage account name (replace `{STORAGE_ACCOUNT}` — must be globally unique)
   - Container name (replace `{CONTAINER}` — e.g. `sec-edgar`)
   - Storage key prefix (replace `{PREFIX}` — e.g. `sec-edgar`)
@@ -27,7 +47,7 @@ Run these once in your terminal. Every command below uses them.
 ```bash
 SUBSCRIPTION=$(az account show --query id --output tsv)
 RG=my-sec-edgar-rg
-LOCATION=eastus
+LOCATION=eastus          # eastus / westus2 are cheapest regions
 STORAGE_ACCOUNT=mysecedgarstorage    # globally unique, lowercase, 3-24 chars, no hyphens
 CONTAINER=sec-edgar
 PREFIX=sec-edgar
@@ -62,7 +82,8 @@ az storage account create \
   --enable-hierarchical-namespace true \
   --https-only true \
   --min-tls-version TLS1_2 \
-  --allow-blob-public-access false
+  --allow-blob-public-access false \
+  --access-tier Hot
 
 # Create the container (filesystem in Azure Data Lake Storage Gen2 terminology)
 az storage fs create \
@@ -79,11 +100,42 @@ az storage account show \
 # Expected: true
 ```
 
+### 2a. Storage Lifecycle Policy (cost optimisation)
+
+Bronze Parquet files are write-once and rarely re-read after 30 days. Moving them to Cool tier cuts storage cost by ~50% for aged data. Silver and Gold are excluded — they are rewritten daily and must stay Hot.
+
+```bash
+az storage account management-policy create \
+  --account-name $STORAGE_ACCOUNT \
+  --resource-group $RG \
+  --policy '{
+    "rules": [
+      {
+        "name": "bronze-to-cool",
+        "enabled": true,
+        "type": "Lifecycle",
+        "definition": {
+          "filters": {
+            "blobTypes": ["blockBlob"],
+            "prefixMatch": ["'"$PREFIX"'/bronze/"]
+          },
+          "actions": {
+            "baseBlob": {
+              "tierToCool": { "daysAfterModificationGreaterThan": 30 },
+              "tierToArchive": { "daysAfterModificationGreaterThan": 365 }
+            }
+          }
+        }
+      }
+    ]
+  }'
+```
+
 ---
 
 ## Step 3 — Create the Azure Container Registry (ACR)
 
-Stores the Docker image used by Azure Batch pool nodes.
+`Basic` is the cheapest tier (~$5/month). It is sufficient for a single image pulled by a small Batch pool.
 
 ```bash
 az acr create \
@@ -180,13 +232,16 @@ az batch account create \
   --location $LOCATION \
   --storage-account $STORAGE_ACCOUNT
 
-echo "Batch account resource ID:"
-az batch account show --name $BATCH_ACCOUNT --resource-group $RG --query id --output tsv
+BATCH_SCOPE=$(az batch account show \
+  --name $BATCH_ACCOUNT --resource-group $RG --query id --output tsv)
+echo "Batch account resource ID: $BATCH_SCOPE"
 ```
 
 ---
 
 ## Step 7 — Create the Azure Data Factory Instance
+
+ADF charges only per activity run (~$0.001 each) — there is no idle cost for the factory itself.
 
 ```bash
 az datafactory create \
@@ -213,9 +268,6 @@ Azure Data Factory uses its own system-assigned managed identity to connect to A
 Allows Azure Data Factory to create and monitor Batch jobs.
 
 ```bash
-BATCH_SCOPE=$(az batch account show \
-  --name $BATCH_ACCOUNT --resource-group $RG --query id --output tsv)
-
 az role assignment create \
   --role "Contributor" \
   --assignee-object-id $ADF_PRINCIPAL \
@@ -237,28 +289,48 @@ az role assignment create \
 
 ---
 
-## Step 9 — Create and Configure the Azure Batch Pool
+## Step 9 — Create and Configure the Azure Batch Pool (cost-optimised)
 
-The pool must have `containerConfiguration` enabled so nodes can run Docker containers. The user-assigned managed identity from Step 4 is attached to the pool.
+**Cost optimisations applied here:**
+- `Standard_D2s_v3` (2 vCPU, 8 GB RAM) — pipeline tasks are sequential; a 4-vCPU node is unused capacity
+- `--target-low-priority-nodes 1 --target-dedicated-nodes 0` — low-priority nodes cost ~80% less than dedicated
+- Auto-scale formula scales the pool to **0 nodes** when no tasks are queued — eliminates idle compute cost entirely
 
 ```bash
-# First, log in to Batch to get a management token
 az batch account login \
   --name $BATCH_ACCOUNT \
   --resource-group $RG
 
-# Create the pool with container support
+# Create the pool with low-priority nodes and auto-scale
 az batch pool create \
   --id sec-edgar-pool \
   --account-name $BATCH_ACCOUNT \
-  --vm-size Standard_D4s_v3 \
-  --target-dedicated-nodes 1 \
+  --vm-size Standard_D2s_v3 \
+  --target-dedicated-nodes 0 \
+  --target-low-priority-nodes 0 \
   --image canonical:0001-com-ubuntu-server-jammy:22_04-lts \
   --node-agent-sku-id "batch.node.ubuntu 22.04" \
-  --identity $IDENTITY_ID
+  --identity $IDENTITY_ID \
+  --enable-auto-scale \
+  --auto-scale-evaluation-interval "PT5M" \
+  --auto-scale-formula "
+    startingNumberOfVMs = 0;
+    maxNumberofVMs = 1;
+    pendingTaskSamplePercent = \$PendingTasks.GetSamplePercent(180 * TimeInterval_Second);
+    pendingTaskSamples = pendingTaskSamplePercent < 70
+      ? startingNumberOfVMs
+      : avg(\$PendingTasks.GetSample(180 * TimeInterval_Second));
+    \$TargetLowPriorityNodes = min(maxNumberofVMs, pendingTaskSamples);
+    \$NodeDeallocationOption = taskcompletion;
+  "
 ```
 
-> **Note:** The full `containerConfiguration` block (specifying the ACR image and container registry credentials) is set in the pool's JSON definition. Use the Azure portal or an ARM template to set `containerConfiguration.type = DockerCompatible` and add the ACR login server under `containerRegistries` with `identityReference` pointing to `$IDENTITY_ID`.
+**Auto-scale behaviour:**
+- When ADF submits a task → pool scales up to 1 low-priority node within ~5 minutes
+- When all tasks complete → pool scales back to 0 nodes; no further compute charges
+- `taskcompletion` deallocation option waits for the running task to finish before removing a node
+
+> **Note:** The full `containerConfiguration` block (specifying the ACR image and container registry) must be set in the pool's JSON definition via the Azure portal or ARM template. Set `containerConfiguration.type = DockerCompatible` and add the ACR login server under `containerRegistries` with `identityReference` pointing to `$IDENTITY_ID`.
 
 ### 9a. Set the AZURE_CLIENT_ID environment variable on the pool
 
@@ -282,7 +354,6 @@ Set this via the Azure portal (Batch account → Pools → sec-edgar-pool → En
 ## Step 10 — Push Docker Image to the Azure Container Registry
 
 ```bash
-# Build and push the pipeline image
 az acr login --name $ACR_NAME
 
 ACR_SERVER=$(az acr show --name $ACR_NAME --query loginServer --output tsv)
@@ -325,7 +396,6 @@ DESC INTEGRATION sec_edgar_adls_int;
 After opening `AZURE_CONSENT_URL` in a browser (consents to Snowflake's multi-tenant application in your tenant):
 
 ```bash
-# Enterprise application display name from DESC INTEGRATION (AZURE_MULTI_TENANT_APP_NAME)
 SNOWFLAKE_APP_NAME="<paste value from DESC INTEGRATION>"
 SNOWFLAKE_PRINCIPAL=$(az ad sp list \
   --display-name $SNOWFLAKE_APP_NAME \
@@ -349,23 +419,7 @@ For local development, `DefaultAzureCredential` uses your `az login` token autom
 az login
 az account set --subscription $SUBSCRIPTION
 
-# Verify your user has storage access
-az role assignment list \
-  --assignee $(az ad signed-in-user show --query id --output tsv) \
-  --scope $STORAGE_SCOPE \
-  --query "[].roleDefinitionName" --output tsv
-
-# Test storage access
-az storage blob list \
-  --container-name $CONTAINER \
-  --account-name $STORAGE_ACCOUNT \
-  --prefix "${PREFIX}/" \
-  --auth-mode login
-```
-
-If you need blob access as yourself (local dev), assign `Storage Blob Data Contributor` to your own user:
-
-```bash
+# Grant your own user blob access for local dev
 MY_PRINCIPAL=$(az ad signed-in-user show --query id --output tsv)
 
 az role assignment create \
@@ -373,6 +427,13 @@ az role assignment create \
   --assignee-object-id $MY_PRINCIPAL \
   --assignee-principal-type User \
   --scope $STORAGE_SCOPE
+
+# Test storage access
+az storage blob list \
+  --container-name $CONTAINER \
+  --account-name $STORAGE_ACCOUNT \
+  --prefix "${PREFIX}/" \
+  --auth-mode login
 ```
 
 ---
@@ -397,17 +458,17 @@ az role assignment list \
 
 Expected output for the Batch pool managed identity:
 ```
-Role                         Scope
----------------------------  -----------------------------------------------
+Role                          Scope
+----------------------------  -----------------------------------------------
 Storage Blob Data Contributor  .../storageAccounts/{STORAGE_ACCOUNT}
 AcrPull                        .../registries/{ACR_NAME}
 ```
 
 Expected output for the Azure Data Factory managed identity:
 ```
-Role         Scope
------------  -----------------------------------------------
-Contributor  .../batchAccounts/{BATCH_ACCOUNT}
+Role                      Scope
+------------------------  -----------------------------------------------
+Contributor               .../batchAccounts/{BATCH_ACCOUNT}
 Storage Blob Data Reader  .../storageAccounts/{STORAGE_ACCOUNT}
 ```
 
@@ -420,21 +481,26 @@ az storage account show \
 # Expected: true
 ```
 
-### Confirm Azure Batch can run jobs on the pool
-
-`az batch task create` requires an existing job. This example runs a host command-line task to verify job scheduling and pool health. To prove your nodes pull from Azure Container Registry, submit a **container** task that references your image after the pool’s `containerConfiguration` is set (Step 9 note).
+### Confirm auto-scale formula is active on the pool
 
 ```bash
-az batch job create \
-  --id test-job \
+az batch pool show \
   --pool-id sec-edgar-pool \
-  --account-name $BATCH_ACCOUNT
+  --account-name $BATCH_ACCOUNT \
+  --query "{autoScaleEnabled:enableAutoScale, formula:autoScaleFormula}" \
+  --output json
+# Expected: enableAutoScale: true, formula present
+```
 
-az batch task create \
-  --job-id test-job \
-  --task-id test-echo \
-  --command-line "/bin/bash -c 'echo OK'" \
-  --account-name $BATCH_ACCOUNT
+### Confirm storage lifecycle policy was applied
+
+```bash
+az storage account management-policy show \
+  --account-name $STORAGE_ACCOUNT \
+  --resource-group $RG \
+  --query "policy.rules[].{Name:name, Enabled:enabled}" \
+  --output table
+# Expected: bronze-to-cool / true
 ```
 
 ### Test blob write from local machine
@@ -446,8 +512,8 @@ az storage blob upload \
   --account-name $STORAGE_ACCOUNT \
   --name "${PREFIX}/test.txt" \
   --file /tmp/test.txt \
-  --auth-mode login
-# Expected: upload succeeds; then delete it:
+  --auth-mode login && echo "Upload OK"
+
 az storage blob delete \
   --container-name $CONTAINER \
   --account-name $STORAGE_ACCOUNT \
@@ -484,5 +550,7 @@ Copy these values into your Azure Data Factory linked service definitions, pipel
 | `abfss://` path not found | Hierarchical Namespace not enabled on the storage account | Cannot be enabled after creation — create a new account with `--enable-hierarchical-namespace true` |
 | Container image pull fails on Batch node | Missing `AcrPull` on the pool identity, or `containerConfiguration` not set | Re-run Step 5b; verify pool has `containerConfiguration.type = DockerCompatible` |
 | `DefaultAzureCredential` picks wrong identity | Multiple managed identities on the Batch node | Set `AZURE_CLIENT_ID` env var on the pool (Step 9a) |
+| Low-priority node evicted mid-task | Azure reclaimed the spot node | ADF/Batch retries automatically; pipeline is idempotent so a re-run is safe |
+| Pool stays at 0 nodes after ADF submits task | Auto-scale evaluation interval has not elapsed yet | Wait up to 5 minutes for the pool to scale up; normal behaviour on first run |
 | Azure Data Factory cannot submit Batch jobs | Missing `Contributor` on the Azure Batch account for the factory managed identity | Re-run Step 8a |
-| Snowflake `COPY INTO` access denied | Consent or storage RBAC incomplete | Open `AZURE_CONSENT_URL` from `DESC INTEGRATION` in a browser; complete Step 11b as a directory role that can consent to enterprise applications (for example, Cloud Application Administrator or Global Administrator) |
+| Snowflake `COPY INTO` access denied | Consent or storage RBAC incomplete | Open `AZURE_CONSENT_URL` from `DESC INTEGRATION` in a browser; complete Step 11b as a Cloud Application Administrator or Global Administrator |
