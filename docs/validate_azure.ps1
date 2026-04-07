@@ -5,16 +5,14 @@
 
 #Requires -Version 5.1
 
-# -- CONFIGURE THESE ----------------------------------------------------------
-$StorageAccount  = ""    # e.g. mysecedgarstorage
-$Container       = ""    # e.g. sec-edgar
-$Prefix          = ""    # e.g. sec-edgar
-$BatchAccount    = ""    # e.g. mysecedgarbatch
-$AcrName         = ""    # e.g. mysecedgaracr
-$AdfName         = ""    # e.g. mysecedgaradf
-$ResourceGroup   = ""    # e.g. my-sec-edgar-rg
-$ManagedIdentity = ""    # e.g. sec-edgar-ingest-identity
-# -----------------------------------------------------------------------------
+$StorageAccount  = "mysecedgarstorage"    # e.g. mysecedgarstorage
+$Container       = "sec-edgar"    # e.g. sec-edgar
+$Prefix          = "sec-edgar"    # e.g. sec-edgar
+$BatchAccount    = "mysecedgarbatch"    # e.g. mysecedgarbatch
+$AcrName         = "mysecedgaracr"    # e.g. mysecedgaracr
+$AdfName         = "mysecedgaradf"    # e.g. mysecedgaradf
+$ResourceGroup   = "my-sec-edgar-rg"    # e.g. my-sec-edgar-rg
+$ManagedIdentity = "sec-edgar-ingest-identity"    # e.g. sec-edgar-ingest-identity
 
 $Pass = 0; $Fail = 0; $Warn = 0
 
