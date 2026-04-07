@@ -1,6 +1,6 @@
-# Azure AD / Entra ID Setup — SEC EDGAR Platform
+# Microsoft Entra ID Setup — SEC EDGAR Platform
 
-Step-by-step guide to create all Managed Identities, RBAC role assignments, and Microsoft Entra ID (formerly Azure AD) configuration required to run the SEC EDGAR ingestion and transform pipeline on Azure (ADF + Azure Batch + ADLS Gen2).
+Step-by-step guide to create managed identities, role-based access control (RBAC) assignments, and Microsoft Entra ID (formerly Azure Active Directory) configuration required to run the SEC EDGAR ingestion and transform pipeline on Azure (Azure Data Factory, Azure Batch, and Azure Data Lake Storage Gen2).
 
 ---
 
@@ -16,7 +16,7 @@ Step-by-step guide to create all Managed Identities, RBAC role assignments, and 
   - Storage key prefix (replace `{PREFIX}` — e.g. `sec-edgar`)
   - Azure Batch account name (replace `{BATCH_ACCOUNT}`)
   - Azure Container Registry name (replace `{ACR_NAME}`)
-  - ADF instance name (replace `{ADF_NAME}`)
+  - Azure Data Factory name (replace `{ADF_NAME}`)
 
 ---
 
@@ -48,9 +48,9 @@ az group create \
 
 ---
 
-## Step 2 — Create the ADLS Gen2 Storage Account
+## Step 2 — Create the Azure Data Lake Storage Gen2 Account
 
-**Hierarchical Namespace must be enabled** — this activates ADLS Gen2 and is required for the `abfss://` scheme used in the pipeline.
+**Hierarchical namespace must be enabled** — this activates Azure Data Lake Storage Gen2 and is required for the `abfss://` scheme used in the pipeline.
 
 ```bash
 az storage account create \
@@ -64,7 +64,7 @@ az storage account create \
   --min-tls-version TLS1_2 \
   --allow-blob-public-access false
 
-# Create the container (filesystem in ADLS Gen2 terminology)
+# Create the container (filesystem in Azure Data Lake Storage Gen2 terminology)
 az storage fs create \
   --name $CONTAINER \
   --account-name $STORAGE_ACCOUNT \
@@ -128,13 +128,13 @@ echo "Client ID (env var):   $CLIENT_ID"
 echo "Principal ID (for RBAC): $PRINCIPAL_ID"
 ```
 
-**The `CLIENT_ID` value** must be set as `AZURE_CLIENT_ID` environment variable on the Batch pool (Step 8). This tells `DefaultAzureCredential` which managed identity to use.
+**The `CLIENT_ID` value** must be set as the `AZURE_CLIENT_ID` environment variable on the Batch pool (Step 9a). This tells `DefaultAzureCredential` which managed identity to use.
 
 ---
 
 ## Step 5 — Grant RBAC Roles to the Managed Identity
 
-### 5a. Storage Blob Data Contributor (ADLS Gen2)
+### 5a. Storage Blob Data Contributor (Azure Data Lake Storage Gen2)
 
 Allows the container to read and write Parquet files in the storage account.
 
@@ -186,7 +186,7 @@ az batch account show --name $BATCH_ACCOUNT --resource-group $RG --query id --ou
 
 ---
 
-## Step 7 — Create the ADF Instance
+## Step 7 — Create the Azure Data Factory Instance
 
 ```bash
 az datafactory create \
@@ -194,23 +194,23 @@ az datafactory create \
   --resource-group $RG \
   --location $LOCATION
 
-# Get ADF's system-assigned managed identity principal ID
+# Get the factory system-assigned managed identity principal ID
 ADF_PRINCIPAL=$(az datafactory show \
   --factory-name $ADF_NAME --resource-group $RG \
   --query identity.principalId --output tsv)
 
-echo "ADF Principal ID: $ADF_PRINCIPAL"
+echo "Azure Data Factory principal ID: $ADF_PRINCIPAL"
 ```
 
 ---
 
-## Step 8 — Grant ADF's Identity Access to Batch and Storage
+## Step 8 — Grant the Data Factory Identity Access to Azure Batch and Storage
 
-ADF uses its own system-assigned managed identity to connect to Batch (to submit jobs) and to Storage (to pass scripts to the Batch pool).
+Azure Data Factory uses its own system-assigned managed identity to connect to Azure Batch (to submit jobs) and to the storage account (to pass scripts to the Batch pool).
 
-### 8a. Contributor on the Batch account
+### 8a. Contributor on the Azure Batch account
 
-Allows ADF to create and monitor Batch jobs.
+Allows Azure Data Factory to create and monitor Batch jobs.
 
 ```bash
 BATCH_SCOPE=$(az batch account show \
@@ -223,9 +223,9 @@ az role assignment create \
   --scope $BATCH_SCOPE
 ```
 
-### 8b. Storage Blob Data Reader on the storage account
+### 8b. Storage Blob Data Reader on the Storage Account
 
-Allows ADF to read script files from the storage container when setting up Custom Activity tasks.
+Allows Azure Data Factory to read script files from the storage container when setting up Custom Activity tasks.
 
 ```bash
 az role assignment create \
@@ -237,9 +237,9 @@ az role assignment create \
 
 ---
 
-## Step 9 — Create and Configure the Batch Pool
+## Step 9 — Create and Configure the Azure Batch Pool
 
-The pool must have `containerConfiguration` enabled so nodes can run Docker containers. The User-Assigned Managed Identity from Step 4 is attached to the pool.
+The pool must have `containerConfiguration` enabled so nodes can run Docker containers. The user-assigned managed identity from Step 4 is attached to the pool.
 
 ```bash
 # First, log in to Batch to get a management token
@@ -253,7 +253,7 @@ az batch pool create \
   --account-name $BATCH_ACCOUNT \
   --vm-size Standard_D4s_v3 \
   --target-dedicated-nodes 1 \
-  --image "microsoft-dsvm:ubuntu-hpc:2204:latest" \
+  --image canonical:0001-com-ubuntu-server-jammy:22_04-lts \
   --node-agent-sku-id "batch.node.ubuntu 22.04" \
   --identity $IDENTITY_ID
 ```
@@ -279,7 +279,7 @@ Set this via the Azure portal (Batch account → Pools → sec-edgar-pool → En
 
 ---
 
-## Step 10 — Push Docker Image to ACR
+## Step 10 — Push Docker Image to the Azure Container Registry
 
 ```bash
 # Build and push the pipeline image
@@ -299,7 +299,7 @@ echo "Image URI: ${ACR_SERVER}/sec-edgar-ingest:latest"
 
 Skip this step if using Path A (DuckDB).
 
-Snowflake reads bronze Parquet from ADLS Gen2 via a Storage Integration. After running `CREATE STORAGE INTEGRATION` in Snowflake and running `DESC INTEGRATION sec_edgar_adls_int`, Snowflake provides a `AZURE_CONSENT_URL` — open it in a browser to complete the Entra ID consent flow.
+Snowflake reads Bronze-layer Parquet from Azure Data Lake Storage Gen2 via a storage integration. After `CREATE STORAGE INTEGRATION` and `DESC INTEGRATION sec_edgar_adls_int` in Snowflake, note `AZURE_CONSENT_URL` in the output — open it in a browser to complete the Microsoft Entra ID admin consent flow.
 
 ### 11a. Prepare the Storage Integration in Snowflake
 
@@ -311,25 +311,27 @@ CREATE STORAGE INTEGRATION sec_edgar_adls_int
   ENABLED = TRUE
   AZURE_TENANT_ID = '<your-tenant-id>'
   STORAGE_ALLOWED_LOCATIONS = (
-    'azure://{STORAGE_ACCOUNT}.blob.core.windows.net/{CONTAINER}/{PREFIX}/bronze/'
+    'azure://<STORAGE_ACCOUNT>.blob.core.windows.net/<CONTAINER>/<PREFIX>/bronze/'
   );
+
+-- Replace angle-bracket placeholders with literal Azure resource names (not shell variables).
 
 DESC INTEGRATION sec_edgar_adls_int;
 -- Note the AZURE_CONSENT_URL and AZURE_MULTI_TENANT_APP_NAME values
 ```
 
-### 11b. Grant Snowflake's App Access to ADLS Gen2
+### 11b. Grant Snowflake's Application Access to Azure Data Lake Storage Gen2
 
-After opening `AZURE_CONSENT_URL` in a browser (signs Snowflake's multi-tenant app into your tenant):
+After opening `AZURE_CONSENT_URL` in a browser (consents to Snowflake's multi-tenant application in your tenant):
 
 ```bash
-# Find the enterprise app object ID Snowflake created in your tenant
-SNOWFLAKE_APP_NAME="<AZURE_MULTI_TENANT_APP_NAME from DESC INTEGRATION>"  # e.g. "xy12345"
+# Enterprise application display name from DESC INTEGRATION (AZURE_MULTI_TENANT_APP_NAME)
+SNOWFLAKE_APP_NAME="<paste value from DESC INTEGRATION>"
 SNOWFLAKE_PRINCIPAL=$(az ad sp list \
   --display-name $SNOWFLAKE_APP_NAME \
   --query "[0].id" --output tsv)
 
-# Grant Storage Blob Data Reader — Snowflake only reads Bronze Parquet
+# Grant Storage Blob Data Reader — Snowflake only reads Bronze-layer Parquet
 az role assignment create \
   --role "Storage Blob Data Reader" \
   --assignee-object-id $SNOWFLAKE_PRINCIPAL \
@@ -386,14 +388,14 @@ az role assignment list \
   --query "[].{Role:roleDefinitionName, Scope:scope}" \
   --output table
 
-echo "=== ADF identity ==="
+echo "=== Azure Data Factory identity ==="
 az role assignment list \
   --assignee $ADF_PRINCIPAL \
   --query "[].{Role:roleDefinitionName, Scope:scope}" \
   --output table
 ```
 
-Expected output for managed identity:
+Expected output for the Batch pool managed identity:
 ```
 Role                         Scope
 ---------------------------  -----------------------------------------------
@@ -401,7 +403,7 @@ Storage Blob Data Contributor  .../storageAccounts/{STORAGE_ACCOUNT}
 AcrPull                        .../registries/{ACR_NAME}
 ```
 
-Expected output for ADF identity:
+Expected output for the Azure Data Factory managed identity:
 ```
 Role         Scope
 -----------  -----------------------------------------------
@@ -418,14 +420,20 @@ az storage account show \
 # Expected: true
 ```
 
-### Confirm ACR image is accessible from the Batch identity
+### Confirm Azure Batch can run jobs on the pool
+
+`az batch task create` requires an existing job. This example runs a host command-line task to verify job scheduling and pool health. To prove your nodes pull from Azure Container Registry, submit a **container** task that references your image after the pool’s `containerConfiguration` is set (Step 9 note).
 
 ```bash
-# Run a test task on the Batch pool — it should pull the image without errors
+az batch job create \
+  --id test-job \
+  --pool-id sec-edgar-pool \
+  --account-name $BATCH_ACCOUNT
+
 az batch task create \
   --job-id test-job \
-  --task-id test-pull \
-  --command-line "/bin/bash -c 'echo image pulled OK'" \
+  --task-id test-echo \
+  --command-line "/bin/bash -c 'echo OK'" \
   --account-name $BATCH_ACCOUNT
 ```
 
@@ -451,19 +459,19 @@ az storage blob delete \
 
 ## Summary — Resource IDs to Record
 
-Copy these values into your ADF linked service definitions, pipeline parameters, and `config/settings.py`:
+Copy these values into your Azure Data Factory linked service definitions, pipeline parameters, and `config/settings.py`:
 
 | Resource | Value |
 |---|---|
 | Storage account name | `{STORAGE_ACCOUNT}` |
 | Container name | `{CONTAINER}` |
-| ADLS Gen2 URL | `abfss://{CONTAINER}@{STORAGE_ACCOUNT}.dfs.core.windows.net/{PREFIX}` |
+| Azure Data Lake Storage Gen2 URL | `abfss://{CONTAINER}@{STORAGE_ACCOUNT}.dfs.core.windows.net/{PREFIX}` |
 | Managed identity client ID (`AZURE_CLIENT_ID`) | Output of Step 4 |
 | Managed identity resource ID | Output of Step 4 |
-| ACR login server | `{ACR_NAME}.azurecr.io` |
+| Azure Container Registry login server | `{ACR_NAME}.azurecr.io` |
 | Docker image URI | `{ACR_NAME}.azurecr.io/sec-edgar-ingest:latest` |
-| ADF name | `{ADF_NAME}` |
-| Batch account name | `{BATCH_ACCOUNT}` |
+| Azure Data Factory name | `{ADF_NAME}` |
+| Azure Batch account name | `{BATCH_ACCOUNT}` |
 | Batch pool ID | `sec-edgar-pool` |
 
 ---
@@ -476,5 +484,5 @@ Copy these values into your ADF linked service definitions, pipeline parameters,
 | `abfss://` path not found | Hierarchical Namespace not enabled on the storage account | Cannot be enabled after creation — create a new account with `--enable-hierarchical-namespace true` |
 | Container image pull fails on Batch node | Missing `AcrPull` on the pool identity, or `containerConfiguration` not set | Re-run Step 5b; verify pool has `containerConfiguration.type = DockerCompatible` |
 | `DefaultAzureCredential` picks wrong identity | Multiple managed identities on the Batch node | Set `AZURE_CLIENT_ID` env var on the pool (Step 9a) |
-| ADF cannot submit Batch jobs | Missing `Contributor` on Batch account for ADF identity | Re-run Step 8a |
-| Snowflake COPY INTO access denied | RBAC consent not completed | Open `AZURE_CONSENT_URL` from `DESC INTEGRATION` output in a browser as a Global Admin |
+| Azure Data Factory cannot submit Batch jobs | Missing `Contributor` on the Azure Batch account for the factory managed identity | Re-run Step 8a |
+| Snowflake `COPY INTO` access denied | Consent or storage RBAC incomplete | Open `AZURE_CONSENT_URL` from `DESC INTEGRATION` in a browser; complete Step 11b as a directory role that can consent to enterprise applications (for example, Cloud Application Administrator or Global Administrator) |
