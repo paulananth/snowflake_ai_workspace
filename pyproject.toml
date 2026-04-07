@@ -29,6 +29,3 @@ aws = [
 # uv resolves all deps and writes uv.lock automatically on `uv sync`
 # No manual venv activation needed -- use `uv run <command>` instead
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
