@@ -1,0 +1,32 @@
+[project]
+name = "sec-edgar-pipeline"
+version = "0.1.0"
+description = "SEC EDGAR raw data ingestion -- cloud-agnostic Medallion pipeline (Bronze/Silver/Gold)"
+requires-python = ">=3.11"
+dependencies = [
+    # Phase 1 -- SEC EDGAR standalone (no cloud deps)
+    "requests>=2.31.0",
+    "pyarrow>=14.0.0",
+    "pandas>=2.0.0",
+    "duckdb>=1.0.0",
+    "pydantic>=2.0.0",
+    # Phase 2 -- Azure Bronze ingest
+    "adlfs>=2024.2.0",
+    "azure-identity>=1.15.0",
+]
+
+[dependency-groups]
+dev = [
+    # Jupyter for interactive exploration / notebook testing
+    "jupyter>=1.0.0",
+    "ipykernel>=6.0.0",
+]
+aws = [
+    # Optional -- only needed for AWS S3 (Path A AWS variant)
+    "s3fs>=2024.2.0",
+]
+
+[tool.uv]
+# uv resolves all deps and writes uv.lock automatically on `uv sync`
+# No manual venv activation needed -- use `uv run <command>` instead
+
