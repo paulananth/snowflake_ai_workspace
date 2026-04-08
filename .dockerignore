@@ -1,0 +1,43 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# uv virtual environment — recreated inside the image by uv sync
+.venv/
+
+# Local Parquet output — never ship data in the image
+output/
+
+# Notebooks — dev only, not needed at runtime
+notebooks/
+*.ipynb
+.ipynb_checkpoints/
+
+# Git history
+.git/
+.gitignore
+.gitattributes
+
+# Documentation
+*.md
+docs/
+
+# Tests
+tests/
+pytest.ini
+.pytest_cache/
+
+# IDE / OS
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+
+# CI / secrets
+.env
+.env.*
+*.pem
+*.key
