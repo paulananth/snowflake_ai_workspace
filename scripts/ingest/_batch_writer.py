@@ -50,7 +50,11 @@ def write_parquet(table: pa.Table, path: str) -> None:
 
     if settings.CLOUD_PROVIDER == "azure":
         import adlfs
-        fs = adlfs.AzureBlobFileSystem(account_name=settings.AZURE_ACCOUNT)
+        from azure.identity import DefaultAzureCredential
+        fs = adlfs.AzureBlobFileSystem(
+            account_name=settings.AZURE_ACCOUNT,
+            credential=DefaultAzureCredential(),
+        )
         blob_path = _abfss_to_blob_path(path)
         buf = io.BytesIO()
         pq.write_table(table, buf, compression="snappy")
@@ -73,7 +77,11 @@ def read_parquet(path: str) -> pa.Table:
 
     if settings.CLOUD_PROVIDER == "azure":
         import adlfs
-        fs = adlfs.AzureBlobFileSystem(account_name=settings.AZURE_ACCOUNT)
+        from azure.identity import DefaultAzureCredential
+        fs = adlfs.AzureBlobFileSystem(
+            account_name=settings.AZURE_ACCOUNT,
+            credential=DefaultAzureCredential(),
+        )
         blob_path = _abfss_to_blob_path(path)
         return pq.read_table(blob_path, filesystem=fs)
 

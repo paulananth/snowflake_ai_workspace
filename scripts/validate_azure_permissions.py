@@ -27,8 +27,10 @@ import sys
 import time
 
 _ROOT = pathlib.Path(__file__).parent.parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+_INGEST = _ROOT / "scripts" / "ingest"
+for _p in (_ROOT, _INGEST):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 # Set a minimal SEC_USER_AGENT if not set, solely for the reachability check.
 # The ingest scripts enforce the real value via KeyError; this script only tests connectivity.
@@ -42,9 +44,30 @@ AAPL_CIK = "0000320193"   # Apple — reliable, always present in SEC EDGAR
 
 # ── Individual checks ─────────────────────────────────────────────────────────
 
+def _adlfs(cloud: str):
+    """
+    Return an authenticated AzureBlobFileSystem.
+
+    local  -> AzureCliCredential  (picks up active az login session)
+    azure  -> DefaultAzureCredential (Managed Identity on Batch, CLI in dev)
+    """
+    import adlfs
+    if cloud == "local":
+        from azure.identity import AzureCliCredential
+        credential = AzureCliCredential()
+    else:
+        from azure.identity import DefaultAzureCredential
+        credential = DefaultAzureCredential()
+    return adlfs.AzureBlobFileSystem(
+        account_name=settings.AZURE_ACCOUNT,
+        credential=credential,
+    )
+
+
 def check_adls_write(cloud: str) -> tuple[bool, str]:
     """Write a small test blob to ADLS, then delete it."""
-    if cloud == "local":
+    if cloud == "local" and not settings.AZURE_ACCOUNT:
+        # Running fully local (no Azure) — check filesystem write instead
         test_path = pathlib.Path(settings.STORAGE_ROOT) / ".permission_check"
         try:
             test_path.parent.mkdir(parents=True, exist_ok=True)
@@ -54,10 +77,8 @@ def check_adls_write(cloud: str) -> tuple[bool, str]:
         except Exception as exc:
             return False, str(exc)
 
-    # Azure
     try:
-        import adlfs
-        fs = adlfs.AzureBlobFileSystem(account_name=settings.AZURE_ACCOUNT)
+        fs = _adlfs(cloud)
         blob = f"{settings.AZURE_CONTAINER}/{settings.STORAGE_PREFIX}/.permission_check"
         with fs.open(blob, "wb") as f:
             f.write(b"ok")
@@ -69,18 +90,17 @@ def check_adls_write(cloud: str) -> tuple[bool, str]:
 
 def check_adls_read(cloud: str) -> tuple[bool, str]:
     """List files in the storage root."""
-    if cloud == "local":
+    if cloud == "local" and not settings.AZURE_ACCOUNT:
         root = pathlib.Path(settings.STORAGE_ROOT)
         try:
             root.mkdir(parents=True, exist_ok=True)
             list(root.iterdir())
-            return True, f"local list OK ({root.resolve()})"
+            return True, f"local filesystem list OK ({root.resolve()})"
         except Exception as exc:
             return False, str(exc)
 
     try:
-        import adlfs
-        fs = adlfs.AzureBlobFileSystem(account_name=settings.AZURE_ACCOUNT)
+        fs = _adlfs(cloud)
         fs.ls(f"{settings.AZURE_CONTAINER}/")
         return True, f"ADLS list OK (account={settings.AZURE_ACCOUNT})"
     except Exception as exc:
@@ -103,21 +123,24 @@ def check_edgar_reachability() -> tuple[bool, str]:
 
 
 def check_credential_identity(cloud: str) -> tuple[bool, str]:
-    """Verify DefaultAzureCredential resolves (Azure) or az login is active (local)."""
-    if cloud == "local":
-        # For local, ADLS write check already proves credential works
-        return True, "local — credential not required (uses filesystem)"
+    """Verify Azure credential resolves — AzureCliCredential locally, DefaultAzureCredential on Batch."""
+    if cloud == "local" and not settings.AZURE_ACCOUNT:
+        return True, "no Azure account configured — skipped"
 
     try:
-        from azure.identity import DefaultAzureCredential
-        cred = DefaultAzureCredential()
-        # Attempt to get a token for Azure storage
+        if cloud == "local":
+            from azure.identity import AzureCliCredential
+            cred = AzureCliCredential()
+            label = "AzureCliCredential"
+        else:
+            from azure.identity import DefaultAzureCredential
+            cred = DefaultAzureCredential()
+            label = "DefaultAzureCredential"
         token = cred.get_token("https://storage.azure.com/.default")
-        # Don't log the token — just confirm it was issued
         expires_in = max(0, token.expires_on - int(time.time()))
-        return True, f"DefaultAzureCredential OK (token expires in {expires_in}s)"
+        return True, f"{label} OK (token expires in {expires_in}s)"
     except Exception as exc:
-        return False, f"DefaultAzureCredential failed: {exc}"
+        return False, f"Credential failed: {exc}"
 
 
 # ── Runner ────────────────────────────────────────────────────────────────────
