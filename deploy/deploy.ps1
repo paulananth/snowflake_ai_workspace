@@ -144,56 +144,71 @@ Write-Host "  OK - All permission checks passed" -ForegroundColor Green
 Write-Host ""
 Write-Host "[5/5] Deploying ADF pipeline..." -ForegroundColor Yellow
 
-# Linked services - deploy AzureStorageLS first (AzureBatchLS references it)
+function Invoke-Az {
+    param([string]$Description, [scriptblock]$Command)
+    Write-Host "  $Description" -NoNewline
+    $output = & $Command 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  [FAILED]" -ForegroundColor Red
+        Write-Host "    $output" -ForegroundColor Red
+        throw "az command failed: $Description"
+    }
+    Write-Host "  [OK]" -ForegroundColor Green
+}
+
+# Linked services - AzureStorageLS must be deployed before AzureBatchLS (it references it)
+$lsDef = Get-Content workflows/adf_linked_services.json -Raw | ConvertFrom-Json
 foreach ($ls in @("AzureStorageLS", "AzureBatchLS")) {
-    Write-Host "  Deploying linked service: $ls"
-    $lsDef = Get-Content workflows/adf_linked_services.json -Raw | ConvertFrom-Json
     $lsObj = $lsDef.linkedServices | Where-Object { $_.name -eq $ls }
     $tmpFile = [System.IO.Path]::GetTempFileName() + ".json"
     $lsObj.properties | ConvertTo-Json -Depth 20 | Set-Content $tmpFile -Encoding UTF8
-    az datafactory linked-service create `
-        --factory-name $AdfName `
-        --resource-group $ResourceGroup `
-        --linked-service-name $ls `
-        --properties "@$tmpFile" `
-        --output none
+    Invoke-Az "Linked service: $ls" {
+        az datafactory linked-service create `
+            --factory-name $AdfName `
+            --resource-group $ResourceGroup `
+            --linked-service-name $ls `
+            --properties "@$tmpFile" `
+            --only-show-errors
+    }
     Remove-Item $tmpFile
-    Write-Host "    OK" -ForegroundColor Green
 }
 
 # Pipeline
-Write-Host "  Deploying pipeline: sec-edgar-bronze-ingest"
 $tmpFile = [System.IO.Path]::GetTempFileName() + ".json"
 $pipelineDef = Get-Content workflows/adf_pipeline.json -Raw | ConvertFrom-Json
 $pipelineDef.properties | ConvertTo-Json -Depth 20 | Set-Content $tmpFile -Encoding UTF8
-az datafactory pipeline create `
-    --factory-name $AdfName `
-    --resource-group $ResourceGroup `
-    --name "sec-edgar-bronze-ingest" `
-    --pipeline "@$tmpFile" `
-    --output none
+Invoke-Az "Pipeline: sec-edgar-bronze-ingest" {
+    az datafactory pipeline create `
+        --factory-name $AdfName `
+        --resource-group $ResourceGroup `
+        --name "sec-edgar-bronze-ingest" `
+        --pipeline "@$tmpFile" `
+        --only-show-errors
+}
 Remove-Item $tmpFile
-Write-Host "    OK" -ForegroundColor Green
 
 # Trigger
-Write-Host "  Deploying trigger: DailyBronzeIngestTrigger"
 $tmpFile = [System.IO.Path]::GetTempFileName() + ".json"
 $triggerDef = Get-Content workflows/adf_trigger.json -Raw | ConvertFrom-Json
 $triggerDef.properties | ConvertTo-Json -Depth 20 | Set-Content $tmpFile -Encoding UTF8
-az datafactory trigger create `
-    --factory-name $AdfName `
-    --resource-group $ResourceGroup `
-    --trigger-name "DailyBronzeIngestTrigger" `
-    --properties "@$tmpFile" `
-    --output none
+Invoke-Az "Trigger: DailyBronzeIngestTrigger (create)" {
+    az datafactory trigger create `
+        --factory-name $AdfName `
+        --resource-group $ResourceGroup `
+        --trigger-name "DailyBronzeIngestTrigger" `
+        --properties "@$tmpFile" `
+        --only-show-errors
+}
 Remove-Item $tmpFile
 
-az datafactory trigger start `
-    --factory-name $AdfName `
-    --resource-group $ResourceGroup `
-    --trigger-name "DailyBronzeIngestTrigger" `
-    --output none
-Write-Host "    OK - Trigger active (fires daily at 06:00 UTC)" -ForegroundColor Green
+Invoke-Az "Trigger: DailyBronzeIngestTrigger (start)" {
+    az datafactory trigger start `
+        --factory-name $AdfName `
+        --resource-group $ResourceGroup `
+        --trigger-name "DailyBronzeIngestTrigger" `
+        --only-show-errors
+}
+Write-Host "  Trigger active - fires daily at 06:00 UTC" -ForegroundColor Green
 
 # ---------------------------------------------------------------------------
 # Summary
