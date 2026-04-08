@@ -1,0 +1,37 @@
+{
+  "linkedServices": [
+    {
+      "name": "AzureStorageLS",
+      "type": "Microsoft.DataFactory/factories/linkedservices",
+      "properties": {
+        "description": "ADLS Gen2 storage account - Bronze Parquet output and ADF activity resources",
+        "type": "AzureBlobStorage",
+        "typeProperties": {
+          "serviceEndpoint": "https://mysecedgarstorage.blob.core.windows.net/",
+          "accountKind": "StorageV2",
+          "authentication": "ManagedIdentity"
+        },
+        "annotations": ["sec-edgar", "adls"]
+      }
+    },
+    {
+      "name": "AzureBatchLS",
+      "type": "Microsoft.DataFactory/factories/linkedservices",
+      "properties": {
+        "description": "Azure Batch pool running the sec-edgar-ingest Docker container",
+        "type": "AzureBatch",
+        "typeProperties": {
+          "accountName": "mysecedgarbatch",
+          "batchUri": "https://mysecedgarbatch.eastus.batch.azure.com",
+          "poolName": "sec-edgar-pool",
+          "linkedServiceName": {
+            "referenceName": "AzureStorageLS",
+            "type": "LinkedServiceReference"
+          },
+          "authentication": "ManagedIdentity"
+        },
+        "annotations": ["sec-edgar", "batch"]
+      }
+    }
+  ]
+}

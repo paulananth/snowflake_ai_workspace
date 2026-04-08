@@ -1,0 +1,40 @@
+{
+  "_comment": [
+    "Tumbling Window Trigger — fires daily at 06:00 UTC.",
+    "Passes windowStartTime as ingestDate to the pipeline.",
+    "Guarantees exactly-once execution per 24-hour window.",
+    "Supports backfill: if a window is missed, ADF re-runs it automatically.",
+    "",
+    "To activate: ADF Studio → Author → Triggers → Import, then click Publish + Activate.",
+    "To backfill a specific date: trigger a manual run with ingestDate = YYYY-MM-DD."
+  ],
+  "name": "DailyBronzeIngestTrigger",
+  "properties": {
+    "description": "Daily SEC EDGAR Bronze ingest at 06:00 UTC. Passes windowStartTime as ingestDate.",
+    "type": "TumblingWindowTrigger",
+    "typeProperties": {
+      "frequency": "Hour",
+      "interval": 24,
+      "startTime": "2026-04-08T06:00:00Z",
+      "delay": "00:00:00",
+      "maxConcurrency": 1,
+      "retryPolicy": {
+        "count": 2,
+        "intervalInSeconds": 30
+      }
+    },
+    "pipeline": {
+      "pipelineReference": {
+        "referenceName": "sec-edgar-bronze-ingest",
+        "type": "PipelineReference"
+      },
+      "parameters": {
+        "ingestDate": {
+          "value": "@formatDateTime(trigger().outputs.windowStartTime, 'yyyy-MM-dd')",
+          "type": "Expression"
+        }
+      }
+    },
+    "annotations": ["sec-edgar", "daily", "bronze"]
+  }
+}
