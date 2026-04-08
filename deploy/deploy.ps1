@@ -13,9 +13,12 @@ $ErrorActionPreference = "Stop"
 # Pre-flight: install required az CLI extensions silently
 # ---------------------------------------------------------------------------
 Write-Host "Installing required az CLI extensions..." -ForegroundColor DarkGray
-az config set extension.dynamic_install_allow_preview=true 2>$null
-az extension add --name datafactory --yes 2>$null
-az extension add --name azure-batch  --yes 2>$null
+# Temporarily allow non-zero exit codes so az warnings don't abort the script
+$ErrorActionPreference = "Continue"
+az config set extension.dynamic_install_allow_preview=true --only-show-errors | Out-Null
+az extension add --name datafactory --yes --only-show-errors | Out-Null
+az extension add --name azure-batch  --yes --only-show-errors | Out-Null
+$ErrorActionPreference = "Stop"
 Write-Host "  OK" -ForegroundColor DarkGray
 
 # ---------------------------------------------------------------------------
