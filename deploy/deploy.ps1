@@ -10,6 +10,15 @@
 $ErrorActionPreference = "Stop"
 
 # ---------------------------------------------------------------------------
+# Pre-flight: install required az CLI extensions silently
+# ---------------------------------------------------------------------------
+Write-Host "Installing required az CLI extensions..." -ForegroundColor DarkGray
+az config set extension.dynamic_install_allow_preview=true 2>$null
+az extension add --name datafactory --yes 2>$null
+az extension add --name azure-batch  --yes 2>$null
+Write-Host "  OK" -ForegroundColor DarkGray
+
+# ---------------------------------------------------------------------------
 # Resource configuration
 # ---------------------------------------------------------------------------
 $StorageAccount  = "mysecedgarstorage"
