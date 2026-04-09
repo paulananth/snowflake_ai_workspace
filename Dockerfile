@@ -12,7 +12,7 @@ COPY pyproject.toml .python-version ./
 # Install production dependencies only (excludes dev group: jupyter, ipykernel).
 # --extra aws pulls in s3fs for AWS deployments; adlfs/azure-identity are already
 # in the default dependency set so both Azure and AWS are covered by one image.
-RUN uv sync --no-dev --extra aws
+RUN uv sync --no-dev --group aws
 
 # Add the uv-managed venv to PATH so 'python' resolves to the venv's interpreter
 ENV PATH=/app/.venv/bin:$PATH
