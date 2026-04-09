@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "${SCRIPT_DIR}/validate_azure_hardened.sh" "$@"
 # validate_azure.sh — SEC EDGAR platform Azure resource validation
 # Run this locally where az login works.
 # Usage: bash validate_azure.sh
@@ -76,6 +78,16 @@ else
   fail "Container '$CONTAINER' not found in '$STORAGE_ACCOUNT'"
 fi
 
+TASK_BUNDLE=$(az storage blob exists \
+  --container-name "$CONTAINER" \
+  --account-name "$STORAGE_ACCOUNT" \
+  --name "adf-resources/sec-edgar-task.zip" \
+  --auth-mode login \
+  --query exists --output tsv 2>/dev/null || echo "")
+[ "$TASK_BUNDLE" = "true" ] \
+  && ok "ADF task bundle exists at '$CONTAINER/adf-resources/sec-edgar-task.zip'" \
+  || warn "ADF task bundle missing at '$CONTAINER/adf-resources/sec-edgar-task.zip' - deploy.ps1 uploads it during Step 3"
+
 # ── 4. LIFECYCLE POLICY ───────────────────────────────────────────────────────
 hdr "4. Lifecycle Management Policy"
 POLICY=$(az storage account management-policy show \
@@ -107,8 +119,8 @@ else
     || warn "Admin user is enabled — disable it: az acr update --name $ACR_NAME --admin-enabled false"
   ACR_IMAGE=$(az acr repository show --name "$ACR_NAME" \
     --repository sec-edgar-ingest --output tsv 2>/dev/null || echo "")
-  [ -n "$ACR_IMAGE" ] && ok "Image 'sec-edgar-ingest' exists in ACR" \
-    || warn "Image 'sec-edgar-ingest' not yet pushed to ACR"
+  [ -n "$ACR_IMAGE" ] && ok "Image 'sec-edgar-ingest' exists in ACR (legacy build artifact)" \
+    || warn "Image 'sec-edgar-ingest' not yet pushed - deploy.ps1 can still build/push it, but the current ADF runtime no longer executes inside that container"
 fi
 
 # ── 6. BATCH ACCOUNT ─────────────────────────────────────────────────────────
@@ -133,11 +145,25 @@ else
   else
     VM=$(echo "$POOL" | python3 -c "import sys,json; print(json.load(sys.stdin).get('vmSize',''))")
     AS=$(echo "$POOL" | python3 -c "import sys,json; print(json.load(sys.stdin).get('autoScale',''))")
+    LP=$(echo "$POOL" | python3 -c "import sys,json; print(json.load(sys.stdin).get('lowPriority',''))")
+    DN=$(echo "$POOL" | python3 -c "import sys,json; print(json.load(sys.stdin).get('dedicated',''))")
+    PUBLISHER=$(az batch pool show --pool-id sec-edgar-pool --account-name "$BATCH_ACCOUNT" --query "deploymentConfiguration.virtualMachineConfiguration.imageReference.publisher" --output tsv 2>/dev/null || echo "")
+    OFFER=$(az batch pool show --pool-id sec-edgar-pool --account-name "$BATCH_ACCOUNT" --query "deploymentConfiguration.virtualMachineConfiguration.imageReference.offer" --output tsv 2>/dev/null || echo "")
+    SKU=$(az batch pool show --pool-id sec-edgar-pool --account-name "$BATCH_ACCOUNT" --query "deploymentConfiguration.virtualMachineConfiguration.imageReference.sku" --output tsv 2>/dev/null || echo "")
+    CONTAINER_CFG=$(az batch pool show --pool-id sec-edgar-pool --account-name "$BATCH_ACCOUNT" --query "deploymentConfiguration.virtualMachineConfiguration.containerConfiguration" --output tsv 2>/dev/null || echo "")
     ok "Batch pool 'sec-edgar-pool' exists (VM: $VM)"
     [ "$VM" = "standard_d2s_v3" ] && ok "VM size is Standard_D2s_v3 (cost-optimised)" \
       || warn "VM size is '$VM' — Standard_D2s_v3 recommended for cost"
     [ "$AS" = "True" ] && ok "Auto-scale enabled — pool scales to 0 when idle" \
       || warn "Auto-scale not enabled — pool may incur idle compute cost"
+    [ "$LP" = "0" ] && ok "Low-priority target nodes are disabled" \
+      || warn "Pool currently targets low-priority nodes ($LP) - this can fail when spot quota is unavailable"
+    [ "$PUBLISHER" = "microsoft-dsvm" ] && [ "$OFFER" = "ubuntu-hpc" ] && [ "$SKU" = "2204" ] \
+      && ok "Pool image is microsoft-dsvm/ubuntu-hpc/2204" \
+      || warn "Pool image is '$PUBLISHER/$OFFER/$SKU' - expected microsoft-dsvm/ubuntu-hpc/2204"
+    [ -z "$CONTAINER_CFG" ] && ok "Pool has no containerConfiguration - host execution is enabled" \
+      || fail "Pool still has containerConfiguration - ADF Custom Activity host execution will fail on container-only pools"
+    ok "Current dedicated target nodes: $DN"
   fi
 fi
 
@@ -167,7 +193,6 @@ if [ -z "$PRINCIPAL_ID" ]; then
 else
   ok "Managed identity '$MANAGED_IDENTITY' found"
   STORAGE_SCOPE="/subscriptions/${SUBSCRIPTION}/resourceGroups/${RG}/providers/Microsoft.Storage/storageAccounts/${STORAGE_ACCOUNT}"
-  ACR_SCOPE=$(az acr show --name "$ACR_NAME" --resource-group "$RG" --query id --output tsv 2>/dev/null || echo "")
 
   CONTRIB=$(az role assignment list --assignee "$PRINCIPAL_ID" \
     --role "Storage Blob Data Contributor" --scope "$STORAGE_SCOPE" \
@@ -176,14 +201,7 @@ else
     && ok "Storage Blob Data Contributor assigned on storage account" \
     || fail "Storage Blob Data Contributor NOT assigned — container writes will fail"
 
-  if [ -n "$ACR_SCOPE" ]; then
-    ACRPULL=$(az role assignment list --assignee "$PRINCIPAL_ID" \
-      --role "AcrPull" --scope "$ACR_SCOPE" \
-      --query "length(@)" --output tsv 2>/dev/null || echo "0")
-    [ "$ACRPULL" -ge 1 ] \
-      && ok "AcrPull assigned on container registry" \
-      || fail "AcrPull NOT assigned — Batch pool cannot pull Docker image"
-  fi
+  warn "AcrPull is no longer required for the current host-executed ADF runtime"
 fi
 
 # ── SUMMARY ───────────────────────────────────────────────────────────────────

@@ -5,6 +5,24 @@
 
 #Requires -Version 5.1
 
+[CmdletBinding()]
+param(
+    [string]$StorageAccount = $(if ($env:AZURE_STORAGE_ACCOUNT) { $env:AZURE_STORAGE_ACCOUNT } else { "mysecedgarstorage" }),
+    [string]$Container = $(if ($env:AZURE_CONTAINER) { $env:AZURE_CONTAINER } else { "sec-edgar" }),
+    [string]$Prefix = $(if ($env:STORAGE_PREFIX) { $env:STORAGE_PREFIX } else { "sec-edgar" }),
+    [string]$BatchAccount = $(if ($env:AZURE_BATCH_ACCOUNT) { $env:AZURE_BATCH_ACCOUNT } else { "mysecedgarbatch" }),
+    [string]$BatchPoolId = $(if ($env:AZURE_BATCH_POOL_ID) { $env:AZURE_BATCH_POOL_ID } else { "sec-edgar-pool" }),
+    [string]$AcrName = $(if ($env:AZURE_ACR_NAME) { $env:AZURE_ACR_NAME } else { "mysecedgaracr" }),
+    [string]$AdfName = $(if ($env:AZURE_DATA_FACTORY_NAME) { $env:AZURE_DATA_FACTORY_NAME } else { "mysecedgaradf" }),
+    [string]$ResourceGroup = $(if ($env:AZURE_RESOURCE_GROUP) { $env:AZURE_RESOURCE_GROUP } else { "my-sec-edgar-rg" }),
+    [string]$ManagedIdentity = $(if ($env:AZURE_MANAGED_IDENTITY_NAME) { $env:AZURE_MANAGED_IDENTITY_NAME } else { "sec-edgar-ingest-identity" }),
+    [string]$PipelineName = $(if ($env:ADF_PIPELINE_NAME) { $env:ADF_PIPELINE_NAME } else { "sec-edgar-bronze-ingest" }),
+    [string]$TriggerName = $(if ($env:ADF_TRIGGER_NAME) { $env:ADF_TRIGGER_NAME } else { "DailyBronzeIngestTrigger" })
+)
+
+& (Join-Path $PSScriptRoot "validate_azure_hardened.ps1") @PSBoundParameters
+return
+
 # -- CONFIGURE THESE ----------------------------------------------------------
 $StorageAccount  = "mysecedgarstorage"    # e.g. mysecedgarstorage
 $Container       = "sec-edgar"            # e.g. sec-edgar
@@ -84,6 +102,19 @@ if ($FsJson) {
     Write-Fail "Container '$Container' not found - run: az storage fs create --name $Container --account-name $StorageAccount --auth-mode login"
 }
 
+$TaskBundleExists = az storage blob exists `
+    --container-name $Container `
+    --account-name $StorageAccount `
+    --name "adf-resources/sec-edgar-task.zip" `
+    --auth-mode login `
+    --query exists `
+    --output tsv 2>$null
+if ($TaskBundleExists -eq "true") {
+    Write-Pass "ADF task bundle exists at '$Container/adf-resources/sec-edgar-task.zip'"
+} else {
+    Write-Warn "ADF task bundle missing at '$Container/adf-resources/sec-edgar-task.zip' - deploy.ps1 uploads it during Step 3"
+}
+
 # -- 4. LIFECYCLE POLICY -------------------------------------------------------
 Write-Hdr "4. Lifecycle Management Policy (cost optimisation)"
 $PolicyJson = az storage account management-policy show `
@@ -121,9 +152,9 @@ if ($AcrJson) {
     $ImgJson = az acr repository show `
         --name $AcrName --repository sec-edgar-ingest --output json 2>$null
     if ($ImgJson) {
-        Write-Pass "Image 'sec-edgar-ingest' exists in ACR"
+        Write-Pass "Image 'sec-edgar-ingest' exists in ACR (legacy build artifact)"
     } else {
-        Write-Warn "Image 'sec-edgar-ingest' not yet pushed - run Step 10 in azure_ad_setup.md"
+        Write-Warn "Image 'sec-edgar-ingest' not yet pushed - deploy.ps1 can still build/push it, but the current ADF runtime no longer executes inside that container"
     }
 } else {
     Write-Fail "ACR '$AcrName' not found in '$ResourceGroup'"
@@ -157,11 +188,25 @@ if ($BatchJson) {
         } else {
             Write-Warn "Auto-scale not enabled - pool may incur idle compute cost"
         }
-        if ($Pool.targetDedicatedNodes -eq 0) {
-            Write-Pass "No dedicated nodes (using low-priority only - cost-optimised)"
+        if ($Pool.targetLowPriorityNodes -gt 0) {
+            Write-Warn "Pool currently targets low-priority nodes ($($Pool.targetLowPriorityNodes)) - this can fail when spot quota is unavailable"
         } else {
-            Write-Warn "Dedicated nodes: $($Pool.targetDedicatedNodes) - consider switching to low-priority"
+            Write-Pass "Low-priority target nodes are disabled"
         }
+        $VmConfig = $Pool.deploymentConfiguration.virtualMachineConfiguration
+        if ($VmConfig.imageReference.publisher -eq "microsoft-dsvm" -and
+            $VmConfig.imageReference.offer -eq "ubuntu-hpc" -and
+            $VmConfig.imageReference.sku -eq "2204") {
+            Write-Pass "Pool image is microsoft-dsvm/ubuntu-hpc/2204"
+        } else {
+            Write-Warn "Pool image is '$($VmConfig.imageReference.publisher)/$($VmConfig.imageReference.offer)/$($VmConfig.imageReference.sku)' - expected microsoft-dsvm/ubuntu-hpc/2204"
+        }
+        if ($null -eq $VmConfig.containerConfiguration) {
+            Write-Pass "Pool has no containerConfiguration - host execution is enabled"
+        } else {
+            Write-Fail "Pool still has containerConfiguration - ADF Custom Activity host execution will fail on container-only pools"
+        }
+        Write-Host "       Current dedicated target: $($Pool.targetDedicatedNodes)" -ForegroundColor DarkGray
     } else {
         Write-Warn "Batch pool 'sec-edgar-pool' not yet created - run Step 9 in azure_ad_setup.md"
     }
@@ -199,22 +244,7 @@ if ($IdentityJson) {
         }
     }
 
-    $AcrScopeJson = az acr show --name $AcrName --resource-group $ResourceGroup --query id --output tsv 2>$null
-    if ($AcrScopeJson) {
-        $AcrPullJson = az role assignment list `
-            --assignee $PrincipalId `
-            --role "AcrPull" `
-            --scope $AcrScopeJson.Trim() `
-            --output json 2>$null
-        if ($AcrPullJson) {
-            $AcrPull = $AcrPullJson | ConvertFrom-Json
-            if ($AcrPull.Count -ge 1) {
-                Write-Pass "AcrPull assigned on container registry"
-            } else {
-                Write-Fail "AcrPull NOT assigned - Batch pool cannot pull Docker image"
-            }
-        }
-    }
+    Write-Warn "AcrPull is no longer required for the current host-executed ADF runtime"
 } else {
     Write-Fail "Managed identity '$ManagedIdentity' not found in '$ResourceGroup'"
 }

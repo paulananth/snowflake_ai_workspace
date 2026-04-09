@@ -7,17 +7,18 @@ Creates Azure components used by the SEC EDGAR ingestion + transform pipeline:
   - Resource group
   - ADLS Gen2 storage account (HNS enabled) + filesystem
   - Storage lifecycle management policy for Bronze -> Cool/Archive
-  - Azure Container Registry (ACR)
+  - Optional Azure Container Registry (ACR) for the legacy Docker artifact path
   - User-assigned managed identity (for Batch nodes) + RBAC assignments
-  - Azure Batch account + cost-optimized pool with autoscale (scale-to-zero)
+  - Azure Batch account + autoscaled pool with dedicated capacity (scale-to-zero)
   - Azure Data Factory (ADF) + RBAC assignments
 
 This script uses the Azure CLI (`az`) and is designed to be re-runnable (best-effort idempotent).
 
 IMPORTANT NOTES (from the guide)
-  - Batch pool container configuration is not fully covered by `az batch pool create` in the guide.
-    You must set pool `containerConfiguration` + `containerRegistries` (with identityReference) via Portal or ARM/Bicep.
-  - If you attach multiple identities to a node, set AZURE_CLIENT_ID on the pool to the user-assigned identity clientId.
+  - The current ADF Custom Activity design runs on the Batch VM host, not inside a container task.
+    Recreate the pool without `containerConfiguration`.
+  - If you attach multiple identities to a node, set AZURE_CLIENT_ID on the host runtime to the
+    user-assigned identity clientId.
 
 .PARAMETER SubscriptionId
 Azure subscription ID. If omitted, uses `az account show`.
@@ -41,7 +42,7 @@ Key prefix for blob paths (e.g. sec-edgar). Used for lifecycle policy prefixMatc
 Azure Batch account name.
 
 .PARAMETER AcrName
-Azure Container Registry name.
+Azure Container Registry name. Optional unless -BuildLegacyDockerArtifact is set.
 
 .PARAMETER AdfName
 Azure Data Factory name.
@@ -55,8 +56,9 @@ Batch pool id. Default: sec-edgar-pool
 .PARAMETER VmSize
 Batch VM size. Default: Standard_D2s_v3
 
-.PARAMETER BuildAndPushImage
-If set, runs ACR login and attempts `docker build` + `docker push` of "${ACR_SERVER}/sec-edgar-ingest:latest".
+.PARAMETER BuildLegacyDockerArtifact
+If set, creates the optional ACR (when needed) and runs `az acr build` for the legacy
+`sec-edgar-ingest:latest` artifact.
 
 .PARAMETER DockerImageName
 Docker image repo/name (without registry). Default: sec-edgar-ingest
@@ -70,71 +72,27 @@ If set, skips interactive prompts and runs all steps.
 
 [CmdletBinding()]
 param(
-  [Parameter(Mandatory = $false)]
-  [string]$SubscriptionId,
-
-  [Parameter(Mandatory = $true)]
-  [ValidateNotNullOrEmpty()]
-  [string]$ResourceGroup,
-
-  [Parameter(Mandatory = $true)]
-  [ValidateNotNullOrEmpty()]
-  [string]$Location,
-
-  [Parameter(Mandatory = $true)]
-  [ValidatePattern('^[a-z0-9]{3,24}$')]
-  [string]$StorageAccount,
-
-  [Parameter(Mandatory = $true)]
-  [ValidateNotNullOrEmpty()]
-  [string]$Container,
-
-  [Parameter(Mandatory = $true)]
-  [ValidateNotNullOrEmpty()]
-  [string]$Prefix,
-
-  [Parameter(Mandatory = $true)]
-  [ValidateNotNullOrEmpty()]
-  [string]$BatchAccount,
-
-  [Parameter(Mandatory = $true)]
-  [ValidateNotNullOrEmpty()]
-  [string]$AcrName,
-
-  [Parameter(Mandatory = $true)]
-  [ValidateNotNullOrEmpty()]
-  [string]$AdfName,
-
-  [Parameter(Mandatory = $false)]
-  [ValidateNotNullOrEmpty()]
-  [string]$IdentityName = 'sec-edgar-ingest-identity',
-
-  [Parameter(Mandatory = $false)]
-  [ValidateNotNullOrEmpty()]
-  [string]$BatchPoolId = 'sec-edgar-pool',
-
-  [Parameter(Mandatory = $false)]
-  [ValidateNotNullOrEmpty()]
-  [string]$VmSize = 'Standard_D2s_v3',
-
-  [Parameter(Mandatory = $false)]
-  [switch]$BuildAndPushImage,
-
-  [Parameter(Mandatory = $false)]
-  [ValidateNotNullOrEmpty()]
+  [string]$SubscriptionId = $(if ($env:AZURE_SUBSCRIPTION_ID) { $env:AZURE_SUBSCRIPTION_ID } else { "" }),
+  [string]$ResourceGroup = $(if ($env:AZURE_RESOURCE_GROUP) { $env:AZURE_RESOURCE_GROUP } else { "my-sec-edgar-rg" }),
+  [string]$Location = $(if ($env:AZURE_LOCATION) { $env:AZURE_LOCATION } else { "eastus" }),
+  [string]$StorageAccount = $(if ($env:AZURE_STORAGE_ACCOUNT) { $env:AZURE_STORAGE_ACCOUNT } else { "mysecedgarstorage" }),
+  [string]$Container = $(if ($env:AZURE_CONTAINER) { $env:AZURE_CONTAINER } else { "sec-edgar" }),
+  [string]$Prefix = $(if ($env:STORAGE_PREFIX) { $env:STORAGE_PREFIX } else { "sec-edgar" }),
+  [string]$BatchAccount = $(if ($env:AZURE_BATCH_ACCOUNT) { $env:AZURE_BATCH_ACCOUNT } else { "mysecedgarbatch" }),
+  [string]$AcrName = $(if ($env:AZURE_ACR_NAME) { $env:AZURE_ACR_NAME } else { "" }),
+  [string]$AdfName = $(if ($env:AZURE_DATA_FACTORY_NAME) { $env:AZURE_DATA_FACTORY_NAME } else { "mysecedgaradf" }),
+  [string]$IdentityName = $(if ($env:AZURE_MANAGED_IDENTITY_NAME) { $env:AZURE_MANAGED_IDENTITY_NAME } else { "sec-edgar-ingest-identity" }),
+  [string]$BatchPoolId = $(if ($env:AZURE_BATCH_POOL_ID) { $env:AZURE_BATCH_POOL_ID } else { "sec-edgar-pool" }),
+  [string]$VmSize = "Standard_D2s_v3",
+  [Alias('BuildAndPushImage')]
+  [switch]$BuildLegacyDockerArtifact,
   [string]$DockerImageName = 'sec-edgar-ingest',
-
-  [Parameter(Mandatory = $false)]
-  [ValidateNotNullOrEmpty()]
   [string]$DockerImageTag = 'latest',
-
-  [Parameter(Mandatory = $false)]
   [switch]$AutoApprove
 )
 
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-$AzCommand = $null
+& (Join-Path $PSScriptRoot "provision-sec-edgar-platform_hardened.ps1") @PSBoundParameters
+return
 
 function Confirm-Step {
   param(
@@ -359,7 +317,7 @@ Write-Host "Container      : $Container"
 Write-Host "Prefix         : $Prefix"
 Write-Host "BatchAccount   : $BatchAccount"
 Write-Host "BatchPoolId    : $BatchPoolId"
-Write-Host "ACR            : $AcrName"
+Write-Host "ACR            : $(if ([string]::IsNullOrWhiteSpace($AcrName)) { '<disabled>' } else { $AcrName })"
 Write-Host "ADF            : $AdfName"
 Write-Host "Identity       : $IdentityName"
 
@@ -504,11 +462,10 @@ Write-Host "PRINCIPAL_ID  : $principalId"
 
 # Step 5 — RBAC roles for the managed identity
 $storageScope = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.Storage/storageAccounts/$StorageAccount"
-if ([string]::IsNullOrWhiteSpace($principalId) -or [string]::IsNullOrWhiteSpace($acrId)) {
-  Write-Host "Skipped managed identity RBAC block because required identity or ACR details are unavailable." -ForegroundColor Yellow
+if ([string]::IsNullOrWhiteSpace($principalId)) {
+  Write-Host "Skipped managed identity RBAC block because the managed identity details are unavailable." -ForegroundColor Yellow
 } else {
   Ensure-RoleAssignment -Role 'Storage Blob Data Contributor' -AssigneeObjectId $principalId -AssigneePrincipalType ServicePrincipal -Scope $storageScope
-  Ensure-RoleAssignment -Role 'AcrPull' -AssigneeObjectId $principalId -AssigneePrincipalType ServicePrincipal -Scope $acrId
 }
 
 # Step 6 — Azure Batch account
@@ -560,12 +517,11 @@ if (Test-StepSkipped $adfPrincipalResult) {
 
 Write-Host "`nADF principal ID: $adfPrincipal" -ForegroundColor Cyan
 
-# Step 8 — RBAC for ADF identity (Batch + Storage)
+# Step 8 - RBAC for ADF identity (Batch)
 if ([string]::IsNullOrWhiteSpace($adfPrincipal) -or [string]::IsNullOrWhiteSpace($batchScope)) {
   Write-Host "Skipped ADF RBAC block because the factory principal ID or Batch scope is unavailable." -ForegroundColor Yellow
 } else {
   Ensure-RoleAssignment -Role 'Contributor' -AssigneeObjectId $adfPrincipal -AssigneePrincipalType ServicePrincipal -Scope $batchScope
-  Ensure-RoleAssignment -Role 'Storage Blob Data Reader' -AssigneeObjectId $adfPrincipal -AssigneePrincipalType ServicePrincipal -Scope $storageScope
 }
 
 # Step 9 — Batch pool (cost-optimized; scale-to-zero)
@@ -576,7 +532,8 @@ pendingTaskSamplePercent = $PendingTasks.GetSamplePercent(180 * TimeInterval_Sec
 pendingTaskSamples = pendingTaskSamplePercent < 70
   ? startingNumberOfVMs
   : avg($PendingTasks.GetSample(180 * TimeInterval_Second));
-$TargetLowPriorityNodes = min(maxNumberofVMs, pendingTaskSamples);
+$TargetDedicatedNodes = min(maxNumberofVMs, pendingTaskSamples);
+$TargetLowPriorityNodes = 0;
 $NodeDeallocationOption = taskcompletion;
 '@ -replace "(\r?\n)+"," "
 
@@ -614,9 +571,9 @@ if (-not $poolExists) {
         deploymentConfiguration = @{
           virtualMachineConfiguration = @{
             imageReference = @{
-              publisher = 'Canonical'
-              offer = '0001-com-ubuntu-server-jammy'
-              sku = '22_04-lts'
+              publisher = 'microsoft-dsvm'
+              offer = 'ubuntu-hpc'
+              sku = '2204'
               version = 'latest'
             }
             nodeAgentSkuId = 'batch.node.ubuntu 22.04'
@@ -641,7 +598,7 @@ if (-not $poolExists) {
         '--uri', "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.Batch/batchAccounts/$BatchAccount/pools/${BatchPoolId}?api-version=2025-06-01",
         '--headers', 'If-None-Match=*',
         '--body', "@$poolDefinitionFile"
-      ) -Title 'Create Batch pool (autoscale)' -Explanation 'Creates the pool with autoscale enabled and a user-assigned managed identity using the Azure Batch management API.' | Out-Null
+      ) -Title 'Create Batch pool (dedicated autoscale)' -Explanation 'Creates the pool with autoscale enabled, dedicated Batch capacity, and a user-assigned managed identity using the Azure Batch management API.' | Out-Null
     } finally {
       if (Test-Path -LiteralPath $poolDefinitionFile) {
         Remove-Item -LiteralPath $poolDefinitionFile -Force -ErrorAction SilentlyContinue
@@ -650,9 +607,9 @@ if (-not $poolExists) {
   }
 }
 
-Write-Host "`nNOTE: Configure Batch pool container settings via Portal/ARM (see docs/azure_ad_setup.md Step 9)." -ForegroundColor Yellow
-Write-Host "      Set AZURE_CLIENT_ID=$clientId on the pool environment settings (Step 9a)." -ForegroundColor Yellow
-Write-Host "      ACR login server: $acrServer" -ForegroundColor Yellow
+Write-Host "`nNOTE: The recommended ADF runtime is a non-container Batch pool that runs the staged task bundle on the host VM." -ForegroundColor Yellow
+Write-Host "      Set AZURE_CLIENT_ID=$clientId on the host runtime environment if multiple managed identities are present." -ForegroundColor Yellow
+Write-Host "      ACR login server: $acrServer (kept for the legacy image build/push workflow)." -ForegroundColor Yellow
 
 # Step 10 — Optional: push Docker image to ACR
 if ($BuildAndPushImage) {

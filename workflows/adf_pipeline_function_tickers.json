@@ -1,0 +1,48 @@
+{
+  "_comment": [
+    "ADF pipeline that invokes the SEC ticker ingest through Azure Function Activity.",
+    "This path is intentionally scoped to the lightweight ticker snapshot ingest."
+  ],
+  "name": "sec-edgar-function-tickers-ingest",
+  "properties": {
+    "description": "Invoke SEC ticker exchange ingest through Azure Function from ADF",
+    "parameters": {
+      "ingestDate": {
+        "type": "string",
+        "defaultValue": "2026-04-09",
+        "description": "Partition date (YYYY-MM-DD) used by the Azure Function ticker ingest"
+      }
+    },
+    "activities": [
+      {
+        "name": "InvokeTickersExchangeFunction",
+        "type": "AzureFunctionActivity",
+        "dependsOn": [],
+        "policy": {
+          "timeout": "0.00:15:00",
+          "retry": 2,
+          "retryIntervalInSeconds": 120,
+          "secureOutput": false,
+          "secureInput": false
+        },
+        "typeProperties": {
+          "functionName": "ingest_tickers_exchange",
+          "method": "POST",
+          "body": {
+            "type": "Expression",
+            "value": "@concat('{\"ingestDate\":\"', pipeline().parameters.ingestDate, '\"}')"
+          }
+        },
+        "linkedServiceName": {
+          "referenceName": "AzureFunctionTickersLS",
+          "type": "LinkedServiceReference"
+        }
+      }
+    ],
+    "annotations": [
+      "sec-edgar",
+      "azure-function",
+      "tickers"
+    ]
+  }
+}

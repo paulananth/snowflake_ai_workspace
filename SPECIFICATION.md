@@ -16,7 +16,7 @@
 
 ## 1. System Overview
 
-This is a **greenfield** cloud-agnostic platform for ingesting, storing, and serving SEC EDGAR financial data. It runs on **AWS** (S3 + ECS Fargate + Step Functions) or **Azure** (ADLS Gen2 + Azure Batch + ADF) — configured by a single `CLOUD_PROVIDER` variable. No Databricks, no Spark cluster, no managed database required.
+This is a **greenfield** cloud-agnostic platform for ingesting, storing, and serving SEC EDGAR financial data. It runs on **AWS** (S3 + ECS Fargate + Step Functions) or **Azure** (ADLS Gen2 + Azure Functions + ADF for lightweight stages, Azure Batch + ADF for longer-running fallback stages) — configured by a single `CLOUD_PROVIDER` variable. No Databricks, no Spark cluster, no managed database required.
 
 **Goals:**
 - Store all raw SEC EDGAR API responses as Parquet files in object storage (auditable, reproducible)
@@ -68,7 +68,7 @@ Snowflake
 - Bronze is **always Parquet in S3/Azure** — append-only, never modified, full audit trail
 - `security_id` is a deterministic 16-char hex hash — stable across re-runs, no sequences needed
 - Ingest tasks run **sequentially** to stay under SEC's 10 req/s total rate limit
-- Single Docker image handles ingestion on both paths; Silver/Gold compute differs per path
+- AWS and the legacy Azure Batch path run the Docker image directly; the validated Azure Functions path packages the same Python modules into a Function zip bundle built by Azure CLI
 
 ---
 
@@ -82,15 +82,15 @@ Snowflake
 5. **AWS Step Functions** state machine (see Section 13)
 
 **Azure:**
-1. **Storage account** with **Hierarchical Namespace enabled** (ADLS Gen2) — required for `abfss://` scheme
-2. **User-Assigned Managed Identity** with RBAC roles — see **Section 6.2**
-3. **Azure Container Registry (ACR)** to store the Docker image
-4. **Azure Batch account** with a pool configured for Docker container execution; pool identity = Managed Identity above
-5. **Azure Data Factory** pipeline (see Section 13)
+1. **Data lake storage account** with **Hierarchical Namespace enabled** (ADLS Gen2) — required for `abfss://` scheme
+2. **Separate Azure Functions host storage account** (`StorageV2`, no Hierarchical Namespace) for the Function App runtime
+3. **Azure Function App** (Flex Consumption for the validated lightweight path; Premium or Dedicated if you need longer timeouts)
+4. **Azure Data Factory** pipeline using **Azure Function Activity** for lightweight stages (see Sections **6.2**, **12.2**, and **13**)
+5. **Optional fallback path** for heavier workloads: **Azure Batch** account + pool + User-Assigned Managed Identity; use this only when a stage exceeds Function limits
 
 **Both clouds (local dev):**
 - **Python 3.11+** and **Docker** installed locally
-- **Cloud CLI** (`aws` or `az`) configured — see **Section 6.1.5** (AWS) or **Section 6.2.6** (Azure)
+- **Cloud CLI** (`aws` or `az`) configured — see **Section 6.1.5** (AWS) or **Section 6.2.5** (Azure)
 
 **Path B (Snowflake) — additional prerequisites:**
 - **Snowflake account** (any edition; Enterprise recommended for `MERGE` performance)
@@ -123,7 +123,7 @@ AWS_REGION      = os.environ.get("AWS_DEFAULT_REGION",  "us-east-1")     # CHANG
 AZURE_ACCOUNT   = os.environ.get("AZURE_STORAGE_ACCOUNT", "myaccount")   # CHANGE THIS
 AZURE_CONTAINER = os.environ.get("AZURE_CONTAINER",       "sec-edgar")   # CHANGE THIS
 # Requires ADLS Gen2 (Hierarchical Namespace enabled on the storage account)
-# Auth: see Section 6.2 (User-Assigned Managed Identity; AZURE_CLIENT_ID env var on Batch pool)
+# Auth: see Section 6.2 (Function App system-assigned Managed Identity on the validated path; Batch UAMI + AZURE_CLIENT_ID only on the fallback path)
 
 # ─── Derived storage root ──────────────────────────────────────────────────────
 def _storage_root() -> str:
@@ -190,6 +190,8 @@ az role assignment create \
   --assignee <managed-identity-client-id> \
   --scope /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Storage/storageAccounts/myaccount
 ```
+
+If you are using the validated Azure Functions path, also create a **separate** `StorageV2` account **without** Hierarchical Namespace for the Function App host runtime. Do not reuse the ADLS Gen2 account as the Function host storage account.
 
 ---
 
@@ -336,123 +338,105 @@ export AWS_DEFAULT_REGION=us-east-1
 
 ### 6.2 Azure — Identity & Access Model
 
-#### Principal hierarchy
+Azure currently has two execution modes:
+- **Primary / validated**: ADF `AzureFunctionActivity` -> Azure Function App -> ADLS Gen2
+- **Fallback for heavier stages**: ADF Custom Activity -> Azure Batch host pool -> ADLS Gen2
+
+#### Primary principal hierarchy (validated path)
 
 ```
-ADF Pipeline (system-assigned MSI)
-  └─ Linked Service → Azure Batch account
-       └─ Batch Pool (User-Assigned Managed Identity) ← containers run as this
-            RBAC assignments on the pool identity:
-              ├─ Storage Blob Data Contributor  →  ADLS Gen2 storage account
-              └─ AcrPull                        →  Azure Container Registry
+ADF Pipeline
+  └─ Azure Function Linked Service
+       └─ Azure Function App (system-assigned Managed Identity) ← Python code runs as this
+            RBAC assignments on the Function identity:
+              └─ Storage Blob Data Contributor  →  ADLS Gen2 storage account
 ```
 
-#### 6.2.1 Create the User-Assigned Managed Identity
+#### 6.2.1 Create the Azure Function App identity
+
+The validated Azure path uses a Python Function App with a **system-assigned managed identity**. Create it on Flex Consumption (or Premium / Dedicated if you need longer execution windows):
 
 ```bash
-az identity create \
-  --name sec-edgar-ingest-identity \
+STORAGE_SCOPE="/subscriptions/{SUB}/resourceGroups/{RG}/providers/Microsoft.Storage/storageAccounts/{DATA_LAKE_ACCOUNT}"
+
+az functionapp create \
+  --name sec-edgar-flex-{suffix} \
   --resource-group my-rg \
-  --location eastus
+  --storage-account {FUNCTION_HOST_STORAGE} \
+  --flexconsumption-location eastus \
+  --functions-version 4 \
+  --runtime python \
+  --runtime-version 3.11 \
+  --instance-memory 2048 \
+  --assign-identity [system] \
+  --role "Storage Blob Data Contributor" \
+  --scope $STORAGE_SCOPE
 
-# Save the client ID — required as AZURE_CLIENT_ID env var on the Batch pool
-CLIENT_ID=$(az identity show \
-  --name sec-edgar-ingest-identity --resource-group my-rg \
-  --query clientId --output tsv)
-
-PRINCIPAL_ID=$(az identity show \
-  --name sec-edgar-ingest-identity --resource-group my-rg \
+FUNCTION_PRINCIPAL_ID=$(az functionapp identity show \
+  --name sec-edgar-flex-{suffix} --resource-group my-rg \
   --query principalId --output tsv)
 ```
 
-#### 6.2.2 RBAC Role Assignments
+#### 6.2.2 Minimum RBAC for the validated Functions path
 
 ```bash
-STORAGE_SCOPE="/subscriptions/{SUB}/resourceGroups/{RG}/providers/Microsoft.Storage/storageAccounts/myaccount"
-ACR_SCOPE="/subscriptions/{SUB}/resourceGroups/{RG}/providers/Microsoft.ContainerRegistry/registries/myregistry"
-
-# Read + write Parquet files in ADLS Gen2
 az role assignment create \
   --role "Storage Blob Data Contributor" \
-  --assignee-object-id $PRINCIPAL_ID \
+  --assignee-object-id $FUNCTION_PRINCIPAL_ID \
   --assignee-principal-type ServicePrincipal \
   --scope $STORAGE_SCOPE
-
-# Pull Docker image onto Batch pool nodes
-az role assignment create \
-  --role "AcrPull" \
-  --assignee-object-id $PRINCIPAL_ID \
-  --assignee-principal-type ServicePrincipal \
-  --scope $ACR_SCOPE
 ```
 
 **Minimum required roles — do not use broader roles:**
 
 | Resource | Role | Justification |
 |---|---|---|
-| ADLS Gen2 storage account | `Storage Blob Data Contributor` | Read + write Parquet; does not grant account management |
-| Azure Container Registry | `AcrPull` | Pull image only; does not allow push or admin |
-| Azure Batch account (ADF linked service) | `Contributor` scoped to Batch account | ADF submits jobs; cannot access storage or other resources |
+| ADLS Gen2 storage account | `Storage Blob Data Contributor` | Function code reads + writes Parquet; does not grant account management |
+| Azure Function linked service secret | Secure String in ADF linked service today; Key Vault recommended later | ADF needs the function key to invoke the HTTP endpoint |
+| Azure Batch account (fallback only) | `Contributor` scoped to Batch account | Only needed if you opt into the Batch fallback path |
 
-#### 6.2.3 Assign Identity to Azure Batch Pool
+#### 6.2.3 ADF linked service authentication
 
-```bash
-IDENTITY_ID="/subscriptions/{SUB}/resourceGroups/{RG}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/sec-edgar-ingest-identity"
+ADF invokes the Function App through an `AzureFunction` linked service. The linked service stores:
+- `functionAppUrl = https://<function-app-host>.azurewebsites.net`
+- `functionKey` as a secure string
 
-az batch pool create \
-  --id sec-edgar-pool \
-  --account-name mybatchaccount \
-  --vm-size Standard_D4s_v3 \
-  --target-dedicated-nodes 2 \
-  --image canonical:0001-com-ubuntu-server-jammy:22_04-lts \
-  --node-agent-sku-id "batch.node.ubuntu 22.04" \
-  --identity $IDENTITY_ID
-```
-
-#### 6.2.4 Container Environment Variable
-
-When multiple managed identities could be present on a node, `DefaultAzureCredential` needs a hint. Set this on the Batch pool's environment settings (not in the Docker image):
-
-```
-AZURE_CLIENT_ID = <client-id from 6.2.1>
-```
-
-`adlfs.AzureBlobFileSystem(credential=DefaultAzureCredential())` and DuckDB `LOAD azure` both pick it up automatically.
-
-#### 6.2.5 ADF System Identity Permissions
-
-ADF connects to Batch and Storage using its own system-assigned managed identity:
+For **Flex Consumption**, query the hostname with:
 
 ```bash
-ADF_PRINCIPAL=$(az datafactory show \
-  --name my-adf --resource-group my-rg \
-  --query identity.principalId --output tsv)
-
-BATCH_SCOPE="/subscriptions/{SUB}/resourceGroups/{RG}/providers/Microsoft.Batch/batchAccounts/mybatchaccount"
-
-az role assignment create --role "Contributor" \
-  --assignee-object-id $ADF_PRINCIPAL \
-  --scope $BATCH_SCOPE
-
-az role assignment create --role "Storage Blob Data Reader" \
-  --assignee-object-id $ADF_PRINCIPAL \
-  --scope $STORAGE_SCOPE
+az functionapp show \
+  --name sec-edgar-flex-{suffix} \
+  --resource-group my-rg \
+  --query properties.defaultHostName \
+  --output tsv
 ```
 
-#### 6.2.6 Local Dev (Azure)
+Do **not** use an empty or malformed hostname in `functionAppUrl`; ADF will fail with `Invalid URI: The hostname could not be parsed.`
 
-`DefaultAzureCredential` automatically picks up `az login`:
+#### 6.2.4 Batch fallback identity model
+
+If a stage exceeds Function timeout or memory limits, move that stage to Azure Batch. In that mode:
+- ADF uses its **system-assigned managed identity** with `Contributor` on the Batch account
+- The Batch pool uses a **user-assigned managed identity**
+- The Batch pool identity gets `Storage Blob Data Contributor` on the ADLS Gen2 account
+- If multiple identities exist on the node, set `AZURE_CLIENT_ID=<batch-uami-client-id>` for `DefaultAzureCredential`
+
+#### 6.2.5 Local Dev (Azure)
+
+`DefaultAzureCredential` automatically picks up `az login` locally:
 
 ```bash
 az login
 az account set --subscription {SUB}
 
-# Verify access
-az storage blob list --container-name sec-edgar \
-  --account-name myaccount --auth-mode login
+az storage blob list \
+  --container-name sec-edgar \
+  --account-name {DATA_LAKE_ACCOUNT} \
+  --auth-mode login
 ```
 
-For CI/CD or non-interactive environments:
+For CI/CD or other non-interactive environments, use service principal environment variables or workload identity:
+
 ```bash
 export AZURE_CLIENT_ID=xxx
 export AZURE_CLIENT_SECRET=xxx
@@ -470,7 +454,7 @@ export AZURE_TENANT_ID=xxx
 | Broad policies (`s3:*`, `Storage Account Contributor`) | Scope to minimum actions on specific resource ARN/ID |
 | Hardcoded credentials in `config/settings.py` | All credentials come from the runtime compute identity |
 | One IAM role/identity shared across dev/staging/prod | Separate identity per environment with separate S3 prefix |
-| Baking `AZURE_CLIENT_SECRET` into the Docker image | Set only `AZURE_CLIENT_ID` on the Batch pool; secret auth is for service principals, not managed identities |
+| Baking `AZURE_CLIENT_SECRET` into the Docker image | Use the Function App system-assigned identity on the validated path; for Batch fallback, set only `AZURE_CLIENT_ID` and avoid service principal secrets |
 
 ---
 
@@ -1763,7 +1747,7 @@ dbt test
 
 ## 13. Orchestration
 
-All three environments (local, AWS, Azure) run the **same Docker container** with different `CMD` overrides per task. Credentials are injected via environment variables; no secrets are baked into the image.
+Local development, AWS, and the legacy Azure Batch path run the Docker image with different `CMD` overrides per task. The validated Azure Functions path packages the same Python modules into a normalized zip bundle, deploys it with Azure CLI remote build, and lets ADF invoke the Function App over HTTP. Credentials are injected via managed identity or linked-service secrets; no storage keys are baked into the repo code.
 
 ### Path A — Pipeline execution order (DuckDB / Parquet)
 
@@ -1788,6 +1772,8 @@ All three environments (local, AWS, Azure) run the **same Docker container** wit
          ▼
 [build_gold]              ← DuckDB in-memory: silver → gold/ (all 5 tables)
 ```
+
+**Azure note:** the currently validated Azure Functions implementation covers the lightweight `ingest_tickers_exchange` stage. Keep the remaining sequence for the target end-state architecture, but move any stage that exceeds Function limits to the Azure Batch fallback path.
 
 **Rule:** All bronze tasks must complete before any silver task starts. The `bronze_gate` task enforces this.
 
@@ -1852,35 +1838,84 @@ Push to registry:
 - **AWS**: `docker build -t {account}.dkr.ecr.{region}.amazonaws.com/sec-edgar-ingest:latest . && docker push ...`
 - **Azure**: `docker build -t {registry}.azurecr.io/sec-edgar-ingest:latest . && docker push ...`
 
-### 12.2 Option A — Azure Data Factory (ADF)
+### 12.2 Option A — Azure Data Factory + Azure Functions
+
+Use this path for lightweight Azure-hosted stages that fit Function limits. This is the **validated Azure pipeline** in the repo today and is implemented for `scripts/ingest/01_ingest_tickers_exchange.py`.
 
 **Infrastructure requirements:**
 | Component | Requirement |
 |---|---|
-| Storage account | ADLS Gen2 (Hierarchical Namespace **must** be enabled) |
-| Azure Batch pool | Ubuntu 22.04 + `containerConfiguration` enabled; pool identity = User-Assigned Managed Identity |
-| ACR | Stores Docker image; Batch pool identity has `AcrPull` role |
-| Managed Identity | `Storage Blob Data Contributor` on the ADLS Gen2 storage account |
+| Data lake storage account | ADLS Gen2 (Hierarchical Namespace **must** be enabled) |
+| Function host storage account | Separate `StorageV2` account with **no** Hierarchical Namespace |
+| Azure Function App | Python 3.11 on Flex Consumption for the validated path; Premium / Dedicated if you need longer timeouts |
+| Managed Identity | Function App system-assigned identity with `Storage Blob Data Contributor` on the ADLS Gen2 account |
+| ADF | `AzureFunction` linked service plus `AzureFunctionActivity` pipeline |
 
-**ADF pipeline** (`workflows/adf_pipeline.json`): Custom Activity per task, all on Azure Batch. Dependencies expressed as ADF activity dependencies.
+**Repo implementation**:
+- Function app project: `function_apps/adf_tickers_ingest/`
+- ADF linked service template: `workflows/adf_linked_services_function_tickers.json`
+- ADF pipeline template: `workflows/adf_pipeline_function_tickers.json`
+- Azure CLI deploy script: `deploy/deploy_function_tickers.ps1`
 
-**Passing parameters to container**: Use CLI args in the `command` field (not `extendedProperties`):
+**Build and deploy flow**:
+1. Package `function_apps/adf_tickers_ingest/` together with `config/` and `scripts/ingest/`.
+2. Build the deployment zip with **forward-slash** entry names. Windows-style backslashes inside the zip cause the Linux Functions runtime to report `0 functions found (Custom)`.
+3. Deploy with Azure CLI remote build:
+   `az functionapp deployment source config-zip --build-remote true`
+4. Set app settings on the Function App:
+   - `SEC_USER_AGENT`
+   - `CLOUD_PROVIDER=azure`
+   - `AZURE_STORAGE_ACCOUNT`
+   - `AZURE_CONTAINER`
+   - `STORAGE_PREFIX`
+5. Create or update the ADF `AzureFunction` linked service using the Function host URL and function key.
+6. Run the ADF pipeline with `ingestDate` in the request body.
+
+**Function host note**: for Flex Consumption, resolve the host URL from `properties.defaultHostName`:
+
+```bash
+az functionapp show \
+  --name sec-edgar-flex-{suffix} \
+  --resource-group my-rg \
+  --query properties.defaultHostName \
+  --output tsv
+```
+
+**ADF pipeline** (`workflows/adf_pipeline_function_tickers.json`): a single `AzureFunctionActivity` that POSTs the ingest date to the Function App.
+
 ```json
 {
-  "name": "ingest_tickers",
-  "type": "Custom",
-  "linkedServiceName": { "referenceName": "AzureBatchLS" },
+  "name": "InvokeTickersExchangeFunction",
+  "type": "AzureFunctionActivity",
+  "linkedServiceName": {
+    "referenceName": "AzureFunctionTickersLS",
+    "type": "LinkedServiceReference"
+  },
+  "policy": {
+    "timeout": "0.00:15:00",
+    "retry": 2,
+    "retryIntervalInSeconds": 120
+  },
   "typeProperties": {
-    "command": "scripts/ingest/01_ingest_tickers_exchange.py --date @{pipeline().parameters.ingestDate}",
-    "resourceLinkedService": { "referenceName": "AzureStorageLS" },
-    "folderPath": "sec-edgar-adf-scripts"
+    "functionName": "ingest_tickers_exchange",
+    "method": "POST",
+    "body": {
+      "type": "Expression",
+      "value": "@concat('{\"ingestDate\":\"', pipeline().parameters.ingestDate, '\"}')"
+    }
   }
 }
 ```
 
-**Trigger**: Tumbling Window Trigger (not Schedule Trigger) — guarantees exactly-once execution per 24h window, supports backfill of missed windows.
+**Current limit**: `function_apps/adf_tickers_ingest/host.json` sets `functionTimeout` to `00:10:00`. If a stage will exceed that limit or requires materially more memory, move that stage to the Azure Batch fallback path instead of forcing it into Functions.
 
-Files to create: `workflows/adf_pipeline.json`, `workflows/adf_linked_services.json`, `workflows/adf_trigger.json`
+**Validation path**:
+1. Directly invoke the Function App and confirm it returns `status = Succeeded`
+2. Run the ADF pipeline and capture the `runId`
+3. Verify the output file exists at:
+   `abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/{PREFIX}/bronze/company_tickers_exchange/ingestion_date={YYYY-MM-DD}/data.parquet`
+
+**Triggering**: use `Trigger now` or a schedule / tumbling-window trigger in ADF. The repo currently ships the linked service and pipeline templates for the validated ticker path; create the trigger separately if you want scheduled execution.
 
 ### 12.3 Option B — AWS Step Functions + ECS Fargate
 
@@ -1982,11 +2017,19 @@ dbt(["test", "--select", "gold.*"])
 **Path A (DuckDB):**
 ```
 sec_edgar_platform/
-├── Dockerfile                              ← single image for ADF Batch, ECS Fargate, and local
-├── requirements.txt                        ← pyarrow, s3fs, adlfs, azure-identity, duckdb, requests
+├── Dockerfile                              ← single image for AWS, legacy Azure Batch, and local
+├── requirements.txt                        ← shared runtime for local/AWS/legacy Batch
 ├── pipeline.py                             ← Path A: local/dev sequential runner
 ├── config/
 │   └── settings.py                         ← CLOUD_PROVIDER, storage config (all from env vars)
+├── function_apps/
+│   └── adf_tickers_ingest/
+│       ├── host.json                       ← Azure Functions host config (`functionTimeout = 00:10:00`)
+│       ├── requirements.txt                ← Azure Functions Python dependencies
+│       ├── .deployment                     ← Azure remote build hint
+│       └── ingest_tickers_exchange/
+│           ├── function.json               ← HTTP-trigger binding definition
+│           └── __init__.py                 ← loads `scripts/ingest/01_ingest_tickers_exchange.py`
 ├── scripts/
 │   ├── ingest/
 │   │   ├── _rate_limiter.py                ← thread-safe RateLimiter (8 req/s per task)
@@ -2001,10 +2044,14 @@ sec_edgar_platform/
 │   │   └── 02_silver_filings_and_facts.py  ← DuckDB in-memory: bronze → silver/filings_index/ + financial_facts/ + corporate_actions/
 │   └── silver_to_gold/
 │       └── 01_build_gold.py                ← DuckDB in-memory: silver → gold/ (5 tables)
+├── deploy/
+│   └── deploy_function_tickers.ps1         ← Azure CLI deploy for Function App + ADF ticker pipeline
 ├── workflows/
-│   ├── adf_pipeline.json                   ← Azure: ADF Custom Activity pipeline
-│   ├── adf_linked_services.json            ← Azure: Batch + Storage linked service definitions
-│   ├── adf_trigger.json                    ← Azure: Tumbling Window Trigger (daily 06:00 UTC)
+│   ├── adf_pipeline_function_tickers.json  ← Azure: ADF Azure Function pipeline (validated ticker path)
+│   ├── adf_linked_services_function_tickers.json ← Azure: Azure Function linked service template
+│   ├── adf_pipeline.json                   ← Azure fallback: ADF Custom Activity pipeline on Batch
+│   ├── adf_linked_services.json            ← Azure fallback: Batch + Storage linked service definitions
+│   ├── adf_trigger.json                    ← Azure fallback: Tumbling Window Trigger (daily 06:00 UTC)
 │   ├── step_functions_definition.json      ← AWS: Step Functions state machine ASL
 │   ├── ecs_task_definition.json            ← AWS: ECS task definition (taskRoleArn, awsvpc, resources)
 │   └── iam/
@@ -2141,12 +2188,19 @@ aws stepfunctions start-execution \
   --state-machine-arn arn:aws:states:{region}:{account}:stateMachine:sec-edgar-daily \
   --input '{"ingestDate": "2024-01-25", "subnets": ["subnet-xxx"], "securityGroups": ["sg-xxx"]}'
 
-# Azure (trigger ADF pipeline manually)
+# Azure (trigger the validated ADF + Function ticker pipeline manually)
+cat >/tmp/adf-run.json <<'JSON'
+{"ingestDate":"2024-01-25"}
+JSON
+
 az datafactory pipeline create-run \
-  --factory-name my-adf --resource-group my-rg \
-  --pipeline-name sec_edgar_daily \
-  --parameters '{"ingestDate": "2024-01-25", "storageAccount": "myaccount"}'
-# Expected runtime: ~60–90 min for full initial load of ~8,000 companies
+  --factory-name my-adf \
+  --resource-group my-rg \
+  --name sec-edgar-function-tickers-ingest \
+  --parameters @/tmp/adf-run.json
+
+# Expected result: Function activity succeeds and writes:
+# abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/{PREFIX}/bronze/company_tickers_exchange/ingestion_date=2024-01-25/data.parquet
 ```
 
 ### Step 8 — Idempotency check (Path A)
@@ -2235,10 +2289,13 @@ Re-run `dbt run` for the same `ingest_date`. Silver rows are upserted (no duplic
 | SEC rate limit across tasks | Ingest tasks run **sequentially** — each uses ≤8 req/s; never exceed 10 req/s total |
 | DuckDB extensions in VPC | Extensions are pre-installed in the Dockerfile — no runtime internet download needed |
 | DuckDB S3 auth (ECS) | ECS task IAM role via instance metadata — no env vars needed (Section 6.1.1) |
-| DuckDB Azure auth (Batch) | `AZURE_CLIENT_ID` on Batch pool → `DefaultAzureCredential` → Managed Identity (Section 6.2.4) |
+| DuckDB Azure auth (Functions) | Function App system-assigned identity → `DefaultAzureCredential` → ADLS Gen2 (Section 6.2.2) |
 | SEC site maintenance (weekends) | Pipeline is idempotent — next run rewrites today's Silver/Gold Parquet |
 | Large companyfacts payload (>10 MB) | Store as-is in Parquet STRING column; DuckDB parses JSON in Silver transform |
-| ADF Batch pool node unavailable | ADF retries automatically; Batch scales pool nodes up/down |
+| Azure Function cold start | First request after inactivity can add a small startup delay; ADF retry policy covers transient startup lag |
+| `0 functions found (Custom)` during deploy | Deployment zip used Windows backslashes in entry names | Build the zip with forward-slash entry names before `config-zip` deployment |
+| `Invalid URI: The hostname could not be parsed.` | ADF linked service stored an empty or malformed `functionAppUrl` | For Flex, query `properties.defaultHostName` and set `functionAppUrl = https://<host>` |
+| Azure Batch fallback node unavailable | Batch retries apply, but only for stages explicitly moved to the Batch fallback path |
 | ECS Fargate task fails | Step Functions retry policy (`MaxAttempts: 2`) automatically retries failed states |
 
 ---
@@ -2270,7 +2327,7 @@ Re-run `dbt run` for the same `ingest_date`. Silver rows are upserted (no duplic
 - [ ] **Provision storage** (Section 5): create S3 bucket or ADLS Gen2 storage account + container with Hierarchical Namespace enabled.
 - [ ] **Configure credentials and IAM/RBAC** — follow **Section 6** completely before running any script:
   - AWS: create ECS Task Role + Execution Role + Step Functions Role (Section 6.1); locally run `aws configure`
-  - Azure: create Managed Identity, assign RBAC roles, configure Batch pool identity (Section 6.2); locally run `az login`
+  - Azure: create the Function App identity, assign ADLS RBAC, configure the ADF Azure Function linked service, and use Batch only for overflow stages (Section 6.2); locally run `az login`
 - [ ] **Create Python virtual environment**:
   ```bash
   python -m venv .venv && source .venv/bin/activate
@@ -2323,7 +2380,7 @@ Start with `financial_statements_annual` (highest value). Each gold table is a s
 
 ### Phase A-5 — Wire Up Cloud Orchestration
 
-**Azure:** Create `workflows/adf_pipeline.json` (Section 13, Option A — ADF). Deploy via ADF portal or ARM.
+**Azure:** Create `function_apps/adf_tickers_ingest/`, `workflows/adf_linked_services_function_tickers.json`, and `workflows/adf_pipeline_function_tickers.json`. Deploy with `deploy/deploy_function_tickers.ps1` (Azure CLI). Use the Azure Batch fallback assets only for stages that exceed Function limits.
 
 **AWS:** Create `workflows/step_functions_definition.json` + `workflows/ecs_task_definition.json` (Section 13, Option B — Step Functions). Deploy via `aws cloudformation` or Terraform.
 

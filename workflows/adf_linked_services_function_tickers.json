@@ -1,0 +1,24 @@
+{
+  "linkedServices": [
+    {
+      "name": "AzureFunctionTickersLS",
+      "type": "Microsoft.DataFactory/factories/linkedservices",
+      "properties": {
+        "description": "Azure Function linked service for the SEC EDGAR ticker ingest function",
+        "type": "AzureFunction",
+        "typeProperties": {
+          "functionAppUrl": "https://__SET_BY_DEPLOY__.azurewebsites.net",
+          "functionKey": {
+            "type": "SecureString",
+            "value": "__SET_BY_DEPLOY__"
+          }
+        },
+        "annotations": [
+          "sec-edgar",
+          "azure-function",
+          "tickers"
+        ]
+      }
+    }
+  ]
+}

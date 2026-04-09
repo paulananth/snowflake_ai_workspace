@@ -1,9 +1,9 @@
 {
   "_comment": [
     "ADF pipeline definition for the SEC EDGAR Bronze ingest.",
-    "4 activities run sequentially: preflight check → tickers → submissions → facts.",
+    "3 activities run sequentially: tickers -> submissions -> facts.",
     "",
-    "Import via: ADF Studio → Author → Pipelines → ... → Import from JSON.",
+    "Import via: ADF Studio -> Author -> Pipelines -> ... -> Import from JSON.",
     "Or deploy via az CLI:",
     "  az datafactory pipeline create \\",
     "    --factory-name <ADF_NAME> \\",
@@ -11,20 +11,24 @@
     "    --name sec-edgar-bronze-ingest \\",
     "    --pipeline @workflows/adf_pipeline.json",
     "",
-    "The 'command' in each Custom Activity runs inside the Docker container",
-    "that is configured on the Azure Batch pool (containerConfiguration).",
-    "ENV vars (SEC_USER_AGENT, CLOUD_PROVIDER, AZURE_STORAGE_ACCOUNT, etc.)",
-    "are set on the Batch pool's environmentSettings — not in this file.",
+    "deploy/deploy.ps1 injects the live host-executed Custom Activity command",
+    "at deploy time. That command unpacks sec-edgar-task.zip from Blob staging,",
+    "creates the uv-managed virtualenv on the Batch node, and runs the target",
+    "Python script on the VM host (not inside a container).",
+    "AzureStorageLS is account-scoped, so folderPath must include the",
+    "filesystem/container name: sec-edgar/adf-resources.",
+    "The checked-in command values below are readable placeholders only.",
+    "Manual imports must update the command values, SEC_USER_AGENT, storage",
+    "account, container, prefix, and managed identity client ID.",
     "",
     "Timeouts are generous to accommodate full NYSE+Nasdaq runs:",
-    "  ValidatePermissions  :  10 minutes",
     "  IngestTickersExchange:  30 minutes",
     "  IngestSubmissions    :   4 hours   (~10k CIKs at 8 req/s with 4 workers)",
     "  IngestCompanyFacts   :   8 hours   (~10k CIKs sequential at 8 req/s)"
   ],
   "name": "sec-edgar-bronze-ingest",
   "properties": {
-    "description": "Daily SEC EDGAR Bronze layer: permission check → ticker snapshot → submissions → XBRL facts",
+    "description": "Daily SEC EDGAR Bronze layer: ticker snapshot -> submissions -> XBRL facts",
     "parameters": {
       "ingestDate": {
         "type": "string",
@@ -34,43 +38,10 @@
     },
     "activities": [
       {
-        "name": "ValidatePermissions",
-        "description": "Pre-flight: verify ADLS write access and SEC EDGAR reachability before committing to a full run",
+        "name": "IngestTickersExchange",
+        "description": "Fetch full SEC ticker-exchange snapshot -> bronze/company_tickers_exchange/",
         "type": "Custom",
         "dependsOn": [],
-        "policy": {
-          "timeout": "0.00:10:00",
-          "retry": 0,
-          "retryIntervalInSeconds": 30,
-          "secureOutput": false,
-          "secureInput": false
-        },
-        "typeProperties": {
-          "command": {
-            "value": "python scripts/validate_azure_permissions.py --cloud azure",
-            "type": "Expression"
-          },
-          "resourceLinkedService": {
-            "referenceName": "AzureStorageLS",
-            "type": "LinkedServiceReference"
-          },
-          "folderPath": "adf-resources"
-        },
-        "linkedServiceName": {
-          "referenceName": "AzureBatchLS",
-          "type": "LinkedServiceReference"
-        }
-      },
-      {
-        "name": "IngestTickersExchange",
-        "description": "Fetch full SEC ticker-exchange snapshot → bronze/company_tickers_exchange/",
-        "type": "Custom",
-        "dependsOn": [
-          {
-            "activity": "ValidatePermissions",
-            "dependencyConditions": ["Succeeded"]
-          }
-        ],
         "policy": {
           "timeout": "0.00:30:00",
           "retry": 1,
@@ -87,7 +58,11 @@
             "referenceName": "AzureStorageLS",
             "type": "LinkedServiceReference"
           },
-          "folderPath": "adf-resources"
+          "folderPath": "sec-edgar/adf-resources",
+          "referenceObjects": {
+            "linkedServices": [],
+            "datasets": []
+          }
         },
         "linkedServiceName": {
           "referenceName": "AzureBatchLS",
@@ -96,7 +71,7 @@
       },
       {
         "name": "IngestSubmissions",
-        "description": "Bulk CIK submissions (NYSE+Nasdaq) → bronze/submissions_meta/ + bronze/filings_index/",
+        "description": "Bulk CIK submissions (NYSE+Nasdaq) -> bronze/submissions_meta/ + bronze/filings_index/",
         "type": "Custom",
         "dependsOn": [
           {
@@ -120,7 +95,11 @@
             "referenceName": "AzureStorageLS",
             "type": "LinkedServiceReference"
           },
-          "folderPath": "adf-resources"
+          "folderPath": "sec-edgar/adf-resources",
+          "referenceObjects": {
+            "linkedServices": [],
+            "datasets": []
+          }
         },
         "linkedServiceName": {
           "referenceName": "AzureBatchLS",
@@ -129,7 +108,7 @@
       },
       {
         "name": "IngestCompanyFacts",
-        "description": "Bulk XBRL facts (all namespaces, all concepts) → bronze/companyfacts/",
+        "description": "Bulk XBRL facts (all namespaces, all concepts) -> bronze/companyfacts/",
         "type": "Custom",
         "dependsOn": [
           {
@@ -153,7 +132,11 @@
             "referenceName": "AzureStorageLS",
             "type": "LinkedServiceReference"
           },
-          "folderPath": "adf-resources"
+          "folderPath": "sec-edgar/adf-resources",
+          "referenceObjects": {
+            "linkedServices": [],
+            "datasets": []
+          }
         },
         "linkedServiceName": {
           "referenceName": "AzureBatchLS",

@@ -1,6 +1,24 @@
-# Microsoft Entra ID Setup — SEC EDGAR Platform
+# Azure Data Pipeline Setup - SEC EDGAR Platform
 
-Step-by-step guide to create managed identities, role-based access control (RBAC) assignments, and Microsoft Entra ID (formerly Azure Active Directory) configuration required to run the SEC EDGAR ingestion and transform pipeline on Azure (Azure Data Factory, Azure Batch, and Azure Data Lake Storage Gen2).
+This document describes the current Azure deployment model for the SEC EDGAR Bronze ingest pipeline.
+
+## Execution Modes
+
+### Primary / validated path
+- Azure Data Factory (ADF) orchestrates the run
+- Azure Function Activity invokes a Python Function App
+- The Function App writes Bronze Parquet to ADLS Gen2 with its system-assigned managed identity
+
+This path is validated in the repo today for the lightweight ticker ingest stage:
+- `scripts/ingest/01_ingest_tickers_exchange.py`
+- `function_apps/adf_tickers_ingest/`
+- `workflows/adf_linked_services_function_tickers.json`
+- `workflows/adf_pipeline_function_tickers.json`
+- `deploy/deploy_function_tickers.ps1`
+
+### Fallback path
+- Use Azure Batch only for stages that exceed Function timeout or memory limits
+- Keep Batch as a separate execution model; do not mix it into the lightweight Function path
 
 ---
 
@@ -8,57 +26,66 @@ Step-by-step guide to create managed identities, role-based access control (RBAC
 
 | Resource | SKU / Config | Est. Cost/month |
 |---|---|---|
-| Azure Data Lake Storage Gen2 | Standard LRS, ~15 GB, Hot → Cool lifecycle | ~$0.40 |
-| Azure Batch compute | Low-priority `Standard_D2s_v3`, ~90 min/day, scale-to-zero | ~$0.85 |
-| Azure Container Registry | Basic tier | ~$5.00 |
-| Azure Data Factory | ~8 activity runs/day | ~$0.25 |
-| Azure Batch account | (no charge for account itself) | $0.00 |
-| **Total** | | **~$6.50/month** |
+| ADLS Gen2 data lake | Standard LRS, ~15 GB, Hot -> Cool lifecycle | ~$0.40 |
+| Azure Function App | Flex Consumption, pay per execution | Low for daily ticker ingest |
+| Function host storage | Standard LRS `StorageV2` | Low |
+| Azure Data Factory | ~1-8 activity runs/day | ~$0.05-$0.25 |
+| Azure Batch account | Optional fallback only | $0.00 for account |
+| Azure Batch compute | Optional fallback only | Varies by region/runtime |
+| Azure Container Registry | Optional / legacy | ~$5.00 only if retained |
 
-**Key cost levers used in this guide:**
-- Low-priority Batch nodes (80% cheaper than dedicated)
-- Pool auto-scales to **0 nodes when idle** — no idle compute charge
-- `Standard_D2s_v3` (2 vCPU) instead of D4s_v3 — tasks run sequentially, not in parallel
-- Storage lifecycle policy moves Bronze Parquet older than 30 days to Cool tier (~50% cheaper storage)
-- ACR Basic is the cheapest registry tier
+The validated ticker-only Function path does not require Azure Batch compute or ACR.
 
 ---
 
 ## Prerequisites
 
-- Azure subscription with Owner or User Access Administrator + Contributor rights
+- Azure subscription with permission to create resources and assign RBAC
 - Azure CLI installed and authenticated: `az login`
-- Decisions made:
-  - Resource group name (replace `{RG}` throughout)
-  - Azure region (replace `{LOCATION}` — `eastus` or `westus2` are typically cheapest)
-  - Storage account name (replace `{STORAGE_ACCOUNT}` — must be globally unique)
-  - Container name (replace `{CONTAINER}` — e.g. `sec-edgar`)
-  - Storage key prefix (replace `{PREFIX}` — e.g. `sec-edgar`)
-  - Azure Batch account name (replace `{BATCH_ACCOUNT}`)
-  - Azure Container Registry name (replace `{ACR_NAME}`)
-  - Azure Data Factory name (replace `{ADF_NAME}`)
+- A globally unique ADLS Gen2 storage account name
+- A globally unique Function host storage account name
+- A globally unique Function App name
+- An ADF factory name
+- A compliant SEC contact string for `SEC_USER_AGENT`
 
----
-
-## Step 0 — Set Shell Variables
-
-Run these once in your terminal. Every command below uses them.
+Recommended Azure CLI prep:
 
 ```bash
-SUBSCRIPTION=$(az account show --query id --output tsv)
-RG=my-sec-edgar-rg
-LOCATION=eastus          # eastus / westus2 are cheapest regions
-STORAGE_ACCOUNT=mysecedgarstorage    # globally unique, lowercase, 3-24 chars, no hyphens
-CONTAINER=sec-edgar
-PREFIX=sec-edgar
-BATCH_ACCOUNT=mysecedgarbatch
-ACR_NAME=mysecedgaracr
-ADF_NAME=mysecedgaradf
+az extension add --name datafactory --yes
+az provider register --namespace Microsoft.Web
+az provider register --namespace Microsoft.Storage
+az provider register --namespace Microsoft.DataFactory
 ```
 
 ---
 
-## Step 1 — Create the Resource Group
+## Step 0 - Set Shell Variables
+
+```bash
+SUBSCRIPTION=$(az account show --query id --output tsv)
+RG=my-sec-edgar-rg
+LOCATION=eastus
+
+DATA_LAKE_ACCOUNT=mysecedgarstorage
+CONTAINER=sec-edgar
+PREFIX=sec-edgar
+
+SUFFIX=$(echo "$SUBSCRIPTION" | tr -d '-' | cut -c1-8)
+FUNCTION_HOST_STORAGE=secedgarfn$SUFFIX
+FUNCTION_APP_NAME=sec-edgar-flex-$SUFFIX
+
+ADF_NAME=mysecedgaradf
+FUNCTION_LINKED_SERVICE=AzureFunctionTickersLS
+PIPELINE_NAME=sec-edgar-function-tickers-ingest
+
+SEC_USER_AGENT="SEC EDGAR Bronze Pipeline you@example.com"
+```
+
+If you want different names, change the variables here and keep them consistent through the guide.
+
+---
+
+## Step 1 - Create the Resource Group
 
 ```bash
 az group create \
@@ -68,13 +95,13 @@ az group create \
 
 ---
 
-## Step 2 — Create the Azure Data Lake Storage Gen2 Account
+## Step 2 - Create the ADLS Gen2 Data Lake
 
-**Hierarchical namespace must be enabled** — this activates Azure Data Lake Storage Gen2 and is required for the `abfss://` scheme used in the pipeline.
+This account stores the Bronze Parquet outputs. Hierarchical Namespace must be enabled.
 
 ```bash
 az storage account create \
-  --name $STORAGE_ACCOUNT \
+  --name $DATA_LAKE_ACCOUNT \
   --resource-group $RG \
   --location $LOCATION \
   --sku Standard_LRS \
@@ -85,76 +112,362 @@ az storage account create \
   --allow-blob-public-access false \
   --access-tier Hot
 
-# Create the container (filesystem in Azure Data Lake Storage Gen2 terminology)
 az storage fs create \
   --name $CONTAINER \
-  --account-name $STORAGE_ACCOUNT \
+  --account-name $DATA_LAKE_ACCOUNT \
   --auth-mode login
 ```
 
-**Verify HNS is enabled:**
+Verify:
+
 ```bash
 az storage account show \
-  --name $STORAGE_ACCOUNT --resource-group $RG \
-  --query isHnsEnabled --output tsv
-# Expected: true
-```
-
-### 2a. Storage Lifecycle Policy (cost optimisation)
-
-Bronze Parquet files are write-once and rarely re-read after 30 days. Moving them to Cool tier cuts storage cost by ~50% for aged data. Silver and Gold are excluded — they are rewritten daily and must stay Hot.
-
-```bash
-az storage account management-policy create \
-  --account-name $STORAGE_ACCOUNT \
+  --name $DATA_LAKE_ACCOUNT \
   --resource-group $RG \
-  --policy '{
-    "rules": [
-      {
-        "name": "bronze-to-cool",
-        "enabled": true,
-        "type": "Lifecycle",
-        "definition": {
-          "filters": {
-            "blobTypes": ["blockBlob"],
-            "prefixMatch": ["'"$PREFIX"'/bronze/"]
-          },
-          "actions": {
-            "baseBlob": {
-              "tierToCool": { "daysAfterModificationGreaterThan": 30 },
-              "tierToArchive": { "daysAfterModificationGreaterThan": 365 }
-            }
-          }
-        }
-      }
-    ]
-  }'
+  --query isHnsEnabled \
+  --output tsv
 ```
+
+Expected output: `true`
 
 ---
 
-## Step 3 — Create the Azure Container Registry (ACR)
+## Step 3 - Create the Function Host Storage Account
 
-`Basic` is the cheapest tier (~$5/month). It is sufficient for a single image pulled by a small Batch pool.
+Azure Functions needs a separate host storage account. It must be a regular `StorageV2` account without Hierarchical Namespace.
 
 ```bash
-az acr create \
-  --name $ACR_NAME \
+az storage account create \
+  --name $FUNCTION_HOST_STORAGE \
   --resource-group $RG \
   --location $LOCATION \
-  --sku Basic \
-  --admin-enabled false
+  --sku Standard_LRS \
+  --kind StorageV2 \
+  --https-only true \
+  --min-tls-version TLS1_2 \
+  --allow-blob-public-access false
+```
 
-ACR_ID=$(az acr show --name $ACR_NAME --resource-group $RG --query id --output tsv)
-echo "ACR ID: $ACR_ID"
-echo "ACR login server: $(az acr show --name $ACR_NAME --query loginServer --output tsv)"
+Verify:
+
+```bash
+az storage account show \
+  --name $FUNCTION_HOST_STORAGE \
+  --resource-group $RG \
+  --query "{kind:kind,isHnsEnabled:isHnsEnabled}" \
+  --output json
+```
+
+Expected output: `kind = StorageV2`, `isHnsEnabled = false`
+
+---
+
+## Step 4 - Create the Azure Function App and Managed Identity
+
+The validated repo path uses Flex Consumption with Python 3.11.
+
+```bash
+STORAGE_SCOPE="/subscriptions/${SUBSCRIPTION}/resourceGroups/${RG}/providers/Microsoft.Storage/storageAccounts/${DATA_LAKE_ACCOUNT}"
+
+az functionapp create \
+  --name $FUNCTION_APP_NAME \
+  --resource-group $RG \
+  --storage-account $FUNCTION_HOST_STORAGE \
+  --flexconsumption-location $LOCATION \
+  --functions-version 4 \
+  --runtime python \
+  --runtime-version 3.11 \
+  --instance-memory 2048 \
+  --assign-identity [system] \
+  --role "Storage Blob Data Contributor" \
+  --scope $STORAGE_SCOPE
+```
+
+Capture the Function identity principal ID:
+
+```bash
+FUNCTION_PRINCIPAL_ID=$(az functionapp identity show \
+  --name $FUNCTION_APP_NAME \
+  --resource-group $RG \
+  --query principalId \
+  --output tsv)
+
+echo "$FUNCTION_PRINCIPAL_ID"
+```
+
+The Function App writes to ADLS Gen2 through this identity.
+
+---
+
+## Step 5 - Create the Azure Data Factory Instance
+
+```bash
+az datafactory create \
+  --factory-name $ADF_NAME \
+  --resource-group $RG \
+  --location $LOCATION
+```
+
+This path does not require ADF managed identity RBAC on storage or Batch. ADF calls the Function App through the Function linked service.
+
+---
+
+## Step 6 - Apply Function App Settings
+
+The app settings must line up with `config/settings.py` and the Function wrapper.
+
+```bash
+az functionapp config appsettings set \
+  --name $FUNCTION_APP_NAME \
+  --resource-group $RG \
+  --settings \
+    SEC_USER_AGENT="$SEC_USER_AGENT" \
+    CLOUD_PROVIDER=azure \
+    AZURE_STORAGE_ACCOUNT=$DATA_LAKE_ACCOUNT \
+    AZURE_CONTAINER=$CONTAINER \
+    STORAGE_PREFIX=$PREFIX
+```
+
+Verify:
+
+```bash
+az functionapp config appsettings list \
+  --name $FUNCTION_APP_NAME \
+  --resource-group $RG \
+  --query "[?name=='SEC_USER_AGENT' || name=='CLOUD_PROVIDER' || name=='AZURE_STORAGE_ACCOUNT' || name=='AZURE_CONTAINER' || name=='STORAGE_PREFIX'].{name:name,value:value}" \
+  --output table
 ```
 
 ---
 
-## Step 4 — Create the User-Assigned Managed Identity
+## Step 7 - Build and Deploy the Function Package
 
-This identity is assigned to the Azure Batch pool nodes. Your Python containers running on those nodes inherit it automatically — no secrets or service principal credentials needed.
+### Supported repo path
+
+Use the checked-in deployment script:
+- `deploy/deploy_function_tickers.ps1`
+
+It packages:
+- `function_apps/adf_tickers_ingest/`
+- `config/`
+- `scripts/ingest/`
+
+It also normalizes zip entry names before deployment. This matters on Windows.
+
+### Why the package build matters
+
+Azure Linux Functions expects zip entry names with forward slashes. If the package is built with Windows backslashes, remote build can succeed but the runtime may still report:
+- `0 functions found (Custom)`
+- `No job functions found`
+
+### Underlying Azure CLI deploy command
+
+The actual deploy call is:
+
+```bash
+az functionapp deployment source config-zip \
+  --name $FUNCTION_APP_NAME \
+  --resource-group $RG \
+  --src <normalized-package.zip> \
+  --build-remote true
+```
+
+### Recommended repo command
+
+From the repo root, run:
+
+```powershell
+.\deploy\deploy_function_tickers.ps1 `
+  -SubscriptionId $env:AZURE_SUBSCRIPTION_ID `
+  -ResourceGroup my-sec-edgar-rg `
+  -Location eastus `
+  -DataStorageAccount mysecedgarstorage `
+  -FunctionStorageAccount $env:AZURE_FUNCTION_STORAGE_ACCOUNT `
+  -Container sec-edgar `
+  -Prefix sec-edgar `
+  -AdfName mysecedgaradf `
+  -FunctionAppName $env:AZURE_FUNCTION_APP_NAME `
+  -PipelineName sec-edgar-function-tickers-ingest `
+  -FunctionLinkedServiceName AzureFunctionTickersLS `
+  -IngestDate 2026-04-09
+```
+
+The script:
+- deploys the Function App package
+- waits for function indexing
+- injects the Function host URL and function key into the ADF linked service template
+- creates or updates the ADF pipeline
+- can directly invoke the function for a smoke test
+
+---
+
+## Step 8 - Create the ADF Linked Service and Pipeline
+
+The repo templates are:
+- `workflows/adf_linked_services_function_tickers.json`
+- `workflows/adf_pipeline_function_tickers.json`
+
+### Linked service requirements
+
+The `AzureFunction` linked service must contain:
+- `functionAppUrl = https://<function-host>.azurewebsites.net`
+- `functionKey` as a secure string
+
+For Flex Consumption, read the host name from `properties.defaultHostName`:
+
+```bash
+FUNCTION_HOST=$(az functionapp show \
+  --name $FUNCTION_APP_NAME \
+  --resource-group $RG \
+  --query properties.defaultHostName \
+  --output tsv)
+
+echo "https://$FUNCTION_HOST"
+```
+
+Do not query `defaultHostName` at the top level for Flex. That returns the wrong shape and can leave `functionAppUrl` as `https://`, which causes:
+- `Invalid URI: The hostname could not be parsed.`
+
+### Pipeline shape
+
+The validated pipeline is a single `AzureFunctionActivity` that POSTs:
+
+```json
+{"ingestDate":"2026-04-09"}
+```
+
+The Function activity in the template calls:
+- `functionName = ingest_tickers_exchange`
+- `method = POST`
+
+---
+
+## Step 9 - Validate the Deployment
+
+### 9a. Confirm the function is indexed
+
+```bash
+az functionapp function list \
+  --name $FUNCTION_APP_NAME \
+  --resource-group $RG \
+  --output table
+```
+
+Expected output includes `ingest_tickers_exchange`
+
+### 9b. Invoke the Function directly
+
+```bash
+FUNCTION_URL=$(az functionapp function show \
+  --name $FUNCTION_APP_NAME \
+  --resource-group $RG \
+  --function-name ingest_tickers_exchange \
+  --query invokeUrlTemplate \
+  --output tsv)
+
+FUNCTION_KEY=$(az functionapp keys list \
+  --name $FUNCTION_APP_NAME \
+  --resource-group $RG \
+  --query functionKeys.default \
+  --output tsv)
+
+cat >/tmp/function-run.json <<'JSON'
+{"ingestDate":"2026-04-09"}
+JSON
+
+az rest \
+  --method post \
+  --url "${FUNCTION_URL}?code=${FUNCTION_KEY}" \
+  --skip-authorization-header \
+  --headers Content-Type=application/json \
+  --body @/tmp/function-run.json
+```
+
+Expected response shape:
+
+```json
+{
+  "status": "Succeeded",
+  "ingestDate": "2026-04-09",
+  "outputPath": "abfss://sec-edgar@mysecedgarstorage.dfs.core.windows.net/sec-edgar/bronze/company_tickers_exchange/ingestion_date=2026-04-09/data.parquet"
+}
+```
+
+### 9c. Run the ADF pipeline
+
+```bash
+cat >/tmp/adf-run.json <<'JSON'
+{"ingestDate":"2026-04-09"}
+JSON
+
+RUN_ID=$(az datafactory pipeline create-run \
+  --factory-name $ADF_NAME \
+  --resource-group $RG \
+  --name $PIPELINE_NAME \
+  --parameters @/tmp/adf-run.json \
+  --query runId \
+  --output tsv)
+
+echo "$RUN_ID"
+```
+
+Check the pipeline run:
+
+```bash
+az datafactory pipeline-run show \
+  --factory-name $ADF_NAME \
+  --resource-group $RG \
+  --run-id $RUN_ID \
+  --output json
+```
+
+### 9d. Check the Bronze output
+
+```bash
+DATA_KEY=$(az storage account keys list \
+  --account-name $DATA_LAKE_ACCOUNT \
+  --resource-group $RG \
+  --query "[0].value" \
+  --output tsv)
+
+az storage fs file show \
+  --file-system $CONTAINER \
+  --path "${PREFIX}/bronze/company_tickers_exchange/ingestion_date=2026-04-09/data.parquet" \
+  --account-name $DATA_LAKE_ACCOUNT \
+  --account-key $DATA_KEY \
+  --output json
+```
+
+Expected result: file metadata is returned and the path exists.
+
+---
+
+## Operational Notes
+
+- `function_apps/adf_tickers_ingest/host.json` currently sets `functionTimeout = 00:10:00`
+- The validated Function path is appropriate for lightweight orchestration and sub-10-minute work
+- If a stage is likely to exceed 10 minutes, uses materially more memory, or needs custom host-level dependencies, move that stage to Azure Batch
+- Keep retries in the ADF Function activity for transient cold starts or short network failures
+
+---
+
+## Path B - Azure Batch Fallback for Heavy Stages
+
+Use this only when a stage does not fit the Function limits.
+
+### Minimum components
+- Azure Batch account
+- Batch pool on a host VM image, not a container pool
+- User-assigned managed identity on the pool
+- `Storage Blob Data Contributor` on the ADLS Gen2 account for the pool identity
+- ADF Custom Activity pipeline and linked services
+
+### Important constraints
+- Do not rely on ADF Custom Activity to launch container tasks; it submits plain Batch tasks
+- Do not configure `containerConfiguration` on the pool for this path
+- Keep ACR optional / legacy unless you have a separate reason to store the image
+
+### Minimal CLI outline
 
 ```bash
 az identity create \
@@ -162,383 +475,38 @@ az identity create \
   --resource-group $RG \
   --location $LOCATION
 
-# Save identifiers — used in later steps and as environment variables
-IDENTITY_ID=$(az identity show \
-  --name sec-edgar-ingest-identity --resource-group $RG \
-  --query id --output tsv)
-
-CLIENT_ID=$(az identity show \
-  --name sec-edgar-ingest-identity --resource-group $RG \
-  --query clientId --output tsv)
-
-PRINCIPAL_ID=$(az identity show \
-  --name sec-edgar-ingest-identity --resource-group $RG \
-  --query principalId --output tsv)
-
-echo "Identity resource ID:  $IDENTITY_ID"
-echo "Client ID (env var):   $CLIENT_ID"
-echo "Principal ID (for RBAC): $PRINCIPAL_ID"
-```
-
-**The `CLIENT_ID` value** must be set as the `AZURE_CLIENT_ID` environment variable on the Batch pool (Step 9a). This tells `DefaultAzureCredential` which managed identity to use.
-
----
-
-## Step 5 — Grant RBAC Roles to the Managed Identity
-
-### 5a. Storage Blob Data Contributor (Azure Data Lake Storage Gen2)
-
-Allows the container to read and write Parquet files in the storage account.
-
-```bash
-STORAGE_SCOPE="/subscriptions/${SUBSCRIPTION}/resourceGroups/${RG}/providers/Microsoft.Storage/storageAccounts/${STORAGE_ACCOUNT}"
-
-az role assignment create \
-  --role "Storage Blob Data Contributor" \
-  --assignee-object-id $PRINCIPAL_ID \
-  --assignee-principal-type ServicePrincipal \
-  --scope $STORAGE_SCOPE
-```
-
-### 5b. AcrPull (Azure Container Registry)
-
-Allows Batch pool nodes to pull the Docker image without a registry password.
-
-```bash
-az role assignment create \
-  --role "AcrPull" \
-  --assignee-object-id $PRINCIPAL_ID \
-  --assignee-principal-type ServicePrincipal \
-  --scope $ACR_ID
-```
-
-**Why these specific roles:**
-
-| Role | Scope | Reason |
-|---|---|---|
-| `Storage Blob Data Contributor` | Storage account | Read + write blobs; does **not** grant storage account management or key access |
-| `AcrPull` | Container registry | Pull images only; cannot push or delete images |
-
-Do not use `Contributor` or `Owner` on the storage account — those grant control-plane access (key rotation, account deletion) that the pipeline does not need.
-
----
-
-## Step 6 — Create the Azure Batch Account
-
-```bash
 az batch account create \
-  --name $BATCH_ACCOUNT \
+  --name mysecedgarbatch \
   --resource-group $RG \
   --location $LOCATION \
-  --storage-account $STORAGE_ACCOUNT
-
-BATCH_SCOPE=$(az batch account show \
-  --name $BATCH_ACCOUNT --resource-group $RG --query id --output tsv)
-echo "Batch account resource ID: $BATCH_SCOPE"
+  --storage-account $DATA_LAKE_ACCOUNT
 ```
+
+Then grant:
+- ADF managed identity -> `Contributor` on the Batch account
+- Batch UAMI -> `Storage Blob Data Contributor` on the data lake account
+
+The legacy Batch assets remain in the repo:
+- `workflows/adf_linked_services.json`
+- `workflows/adf_pipeline.json`
+- `workflows/adf_trigger.json`
 
 ---
 
-## Step 7 — Create the Azure Data Factory Instance
-
-ADF charges only per activity run (~$0.001 each) — there is no idle cost for the factory itself.
-
-```bash
-az datafactory create \
-  --factory-name $ADF_NAME \
-  --resource-group $RG \
-  --location $LOCATION
-
-# Get the factory system-assigned managed identity principal ID
-ADF_PRINCIPAL=$(az datafactory show \
-  --factory-name $ADF_NAME --resource-group $RG \
-  --query identity.principalId --output tsv)
-
-echo "Azure Data Factory principal ID: $ADF_PRINCIPAL"
-```
-
----
-
-## Step 8 — Grant the Data Factory Identity Access to Azure Batch and Storage
-
-Azure Data Factory uses its own system-assigned managed identity to connect to Azure Batch (to submit jobs) and to the storage account (to pass scripts to the Batch pool).
-
-### 8a. Contributor on the Azure Batch account
-
-Allows Azure Data Factory to create and monitor Batch jobs.
-
-```bash
-az role assignment create \
-  --role "Contributor" \
-  --assignee-object-id $ADF_PRINCIPAL \
-  --assignee-principal-type ServicePrincipal \
-  --scope $BATCH_SCOPE
-```
-
-### 8b. Storage Blob Data Reader on the Storage Account
-
-Allows Azure Data Factory to read script files from the storage container when setting up Custom Activity tasks.
-
-```bash
-az role assignment create \
-  --role "Storage Blob Data Reader" \
-  --assignee-object-id $ADF_PRINCIPAL \
-  --assignee-principal-type ServicePrincipal \
-  --scope $STORAGE_SCOPE
-```
-
----
-
-## Step 9 — Create and Configure the Azure Batch Pool (cost-optimised)
-
-**Cost optimisations applied here:**
-- `Standard_D2s_v3` (2 vCPU, 8 GB RAM) — pipeline tasks are sequential; a 4-vCPU node is unused capacity
-- `--target-low-priority-nodes 1 --target-dedicated-nodes 0` — low-priority nodes cost ~80% less than dedicated
-- Auto-scale formula scales the pool to **0 nodes** when no tasks are queued — eliminates idle compute cost entirely
-
-```bash
-az batch account login \
-  --name $BATCH_ACCOUNT \
-  --resource-group $RG
-
-# Create the pool with low-priority nodes and auto-scale
-az batch pool create \
-  --id sec-edgar-pool \
-  --account-name $BATCH_ACCOUNT \
-  --vm-size Standard_D2s_v3 \
-  --target-dedicated-nodes 0 \
-  --target-low-priority-nodes 0 \
-  --image canonical:0001-com-ubuntu-server-jammy:22_04-lts \
-  --node-agent-sku-id "batch.node.ubuntu 22.04" \
-  --identity $IDENTITY_ID \
-  --enable-auto-scale \
-  --auto-scale-evaluation-interval "PT5M" \
-  --auto-scale-formula "
-    startingNumberOfVMs = 0;
-    maxNumberofVMs = 1;
-    pendingTaskSamplePercent = \$PendingTasks.GetSamplePercent(180 * TimeInterval_Second);
-    pendingTaskSamples = pendingTaskSamplePercent < 70
-      ? startingNumberOfVMs
-      : avg(\$PendingTasks.GetSample(180 * TimeInterval_Second));
-    \$TargetLowPriorityNodes = min(maxNumberofVMs, pendingTaskSamples);
-    \$NodeDeallocationOption = taskcompletion;
-  "
-```
-
-**Auto-scale behaviour:**
-- When ADF submits a task → pool scales up to 1 low-priority node within ~5 minutes
-- When all tasks complete → pool scales back to 0 nodes; no further compute charges
-- `taskcompletion` deallocation option waits for the running task to finish before removing a node
-
-> **Note:** The full `containerConfiguration` block (specifying the ACR image and container registry) must be set in the pool's JSON definition via the Azure portal or ARM template. Set `containerConfiguration.type = DockerCompatible` and add the ACR login server under `containerRegistries` with `identityReference` pointing to `$IDENTITY_ID`.
-
-### 9a. Set the AZURE_CLIENT_ID environment variable on the pool
-
-When multiple managed identities are present on a Batch node, `DefaultAzureCredential` needs a hint. Add this to the pool's `environmentSettings`:
-
-```json
-{
-  "environmentSettings": [
-    {
-      "name": "AZURE_CLIENT_ID",
-      "value": "<CLIENT_ID from Step 4>"
-    }
-  ]
-}
-```
-
-Set this via the Azure portal (Batch account → Pools → sec-edgar-pool → Environment settings) or include it in the ARM/Bicep template for the pool.
-
----
-
-## Step 10 — Push Docker Image to the Azure Container Registry
-
-```bash
-az acr login --name $ACR_NAME
-
-ACR_SERVER=$(az acr show --name $ACR_NAME --query loginServer --output tsv)
-
-docker build -t ${ACR_SERVER}/sec-edgar-ingest:latest .
-docker push ${ACR_SERVER}/sec-edgar-ingest:latest
-
-echo "Image URI: ${ACR_SERVER}/sec-edgar-ingest:latest"
-```
-
----
-
-## Step 11 (Path B only) — Snowflake Azure Storage Integration
-
-Skip this step if using Path A (DuckDB).
-
-Snowflake reads Bronze-layer Parquet from Azure Data Lake Storage Gen2 via a storage integration. After `CREATE STORAGE INTEGRATION` and `DESC INTEGRATION sec_edgar_adls_int` in Snowflake, note `AZURE_CONSENT_URL` in the output — open it in a browser to complete the Microsoft Entra ID admin consent flow.
-
-### 11a. Prepare the Storage Integration in Snowflake
-
-```sql
--- Run as ACCOUNTADMIN in Snowflake
-CREATE STORAGE INTEGRATION sec_edgar_adls_int
-  TYPE = EXTERNAL_STAGE
-  STORAGE_PROVIDER = 'AZURE'
-  ENABLED = TRUE
-  AZURE_TENANT_ID = '<your-tenant-id>'
-  STORAGE_ALLOWED_LOCATIONS = (
-    'azure://<STORAGE_ACCOUNT>.blob.core.windows.net/<CONTAINER>/<PREFIX>/bronze/'
-  );
-
--- Replace angle-bracket placeholders with literal Azure resource names (not shell variables).
-
-DESC INTEGRATION sec_edgar_adls_int;
--- Note the AZURE_CONSENT_URL and AZURE_MULTI_TENANT_APP_NAME values
-```
-
-### 11b. Grant Snowflake's Application Access to Azure Data Lake Storage Gen2
-
-After opening `AZURE_CONSENT_URL` in a browser (consents to Snowflake's multi-tenant application in your tenant):
-
-```bash
-SNOWFLAKE_APP_NAME="<paste value from DESC INTEGRATION>"
-SNOWFLAKE_PRINCIPAL=$(az ad sp list \
-  --display-name $SNOWFLAKE_APP_NAME \
-  --query "[0].id" --output tsv)
-
-# Grant Storage Blob Data Reader — Snowflake only reads Bronze-layer Parquet
-az role assignment create \
-  --role "Storage Blob Data Reader" \
-  --assignee-object-id $SNOWFLAKE_PRINCIPAL \
-  --assignee-principal-type ServicePrincipal \
-  --scope $STORAGE_SCOPE
-```
-
----
-
-## Step 12 — Local Dev (Azure)
-
-For local development, `DefaultAzureCredential` uses your `az login` token automatically — no service principal or managed identity needed locally.
-
-```bash
-az login
-az account set --subscription $SUBSCRIPTION
-
-# Grant your own user blob access for local dev
-MY_PRINCIPAL=$(az ad signed-in-user show --query id --output tsv)
-
-az role assignment create \
-  --role "Storage Blob Data Contributor" \
-  --assignee-object-id $MY_PRINCIPAL \
-  --assignee-principal-type User \
-  --scope $STORAGE_SCOPE
-
-# Test storage access
-az storage blob list \
-  --container-name $CONTAINER \
-  --account-name $STORAGE_ACCOUNT \
-  --prefix "${PREFIX}/" \
-  --auth-mode login
-```
-
----
-
-## Verification
-
-### Confirm all role assignments exist
-
-```bash
-echo "=== Managed Identity (sec-edgar-ingest-identity) ==="
-az role assignment list \
-  --assignee $PRINCIPAL_ID \
-  --query "[].{Role:roleDefinitionName, Scope:scope}" \
-  --output table
-
-echo "=== Azure Data Factory identity ==="
-az role assignment list \
-  --assignee $ADF_PRINCIPAL \
-  --query "[].{Role:roleDefinitionName, Scope:scope}" \
-  --output table
-```
-
-Expected output for the Batch pool managed identity:
-```
-Role                          Scope
-----------------------------  -----------------------------------------------
-Storage Blob Data Contributor  .../storageAccounts/{STORAGE_ACCOUNT}
-AcrPull                        .../registries/{ACR_NAME}
-```
-
-Expected output for the Azure Data Factory managed identity:
-```
-Role                      Scope
-------------------------  -----------------------------------------------
-Contributor               .../batchAccounts/{BATCH_ACCOUNT}
-Storage Blob Data Reader  .../storageAccounts/{STORAGE_ACCOUNT}
-```
-
-### Confirm HNS is enabled on storage account
-
-```bash
-az storage account show \
-  --name $STORAGE_ACCOUNT --resource-group $RG \
-  --query isHnsEnabled --output tsv
-# Expected: true
-```
-
-### Confirm auto-scale formula is active on the pool
-
-```bash
-az batch pool show \
-  --pool-id sec-edgar-pool \
-  --account-name $BATCH_ACCOUNT \
-  --query "{autoScaleEnabled:enableAutoScale, formula:autoScaleFormula}" \
-  --output json
-# Expected: enableAutoScale: true, formula present
-```
-
-### Confirm storage lifecycle policy was applied
-
-```bash
-az storage account management-policy show \
-  --account-name $STORAGE_ACCOUNT \
-  --resource-group $RG \
-  --query "policy.rules[].{Name:name, Enabled:enabled}" \
-  --output table
-# Expected: bronze-to-cool / true
-```
-
-### Test blob write from local machine
-
-```bash
-echo "test" > /tmp/test.txt
-az storage blob upload \
-  --container-name $CONTAINER \
-  --account-name $STORAGE_ACCOUNT \
-  --name "${PREFIX}/test.txt" \
-  --file /tmp/test.txt \
-  --auth-mode login && echo "Upload OK"
-
-az storage blob delete \
-  --container-name $CONTAINER \
-  --account-name $STORAGE_ACCOUNT \
-  --name "${PREFIX}/test.txt" \
-  --auth-mode login
-```
-
----
-
-## Summary — Resource IDs to Record
-
-Copy these values into your Azure Data Factory linked service definitions, pipeline parameters, and `config/settings.py`:
+## Summary - Resource Values to Record
 
 | Resource | Value |
 |---|---|
-| Storage account name | `{STORAGE_ACCOUNT}` |
-| Container name | `{CONTAINER}` |
-| Azure Data Lake Storage Gen2 URL | `abfss://{CONTAINER}@{STORAGE_ACCOUNT}.dfs.core.windows.net/{PREFIX}` |
-| Managed identity client ID (`AZURE_CLIENT_ID`) | Output of Step 4 |
-| Managed identity resource ID | Output of Step 4 |
-| Azure Container Registry login server | `{ACR_NAME}.azurecr.io` |
-| Docker image URI | `{ACR_NAME}.azurecr.io/sec-edgar-ingest:latest` |
-| Azure Data Factory name | `{ADF_NAME}` |
-| Azure Batch account name | `{BATCH_ACCOUNT}` |
-| Batch pool ID | `sec-edgar-pool` |
+| ADLS Gen2 account | `$DATA_LAKE_ACCOUNT` |
+| ADLS filesystem / container | `$CONTAINER` |
+| ADLS DFS URL | `abfss://$CONTAINER@$DATA_LAKE_ACCOUNT.dfs.core.windows.net/$PREFIX` |
+| Function host storage account | `$FUNCTION_HOST_STORAGE` |
+| Function App name | `$FUNCTION_APP_NAME` |
+| Function host URL | `https://<properties.defaultHostName>` |
+| ADF factory name | `$ADF_NAME` |
+| ADF Function linked service | `$FUNCTION_LINKED_SERVICE` |
+| ADF ticker pipeline | `$PIPELINE_NAME` |
+| Bronze ticker output path | `$PREFIX/bronze/company_tickers_exchange/ingestion_date=<date>/data.parquet` |
 
 ---
 
@@ -546,11 +514,16 @@ Copy these values into your Azure Data Factory linked service definitions, pipel
 
 | Error | Cause | Fix |
 |---|---|---|
-| `AuthorizationPermissionMismatch` when writing blobs | Missing `Storage Blob Data Contributor` on the identity | Re-run Step 5a; wait up to 5 minutes for RBAC propagation |
-| `abfss://` path not found | Hierarchical Namespace not enabled on the storage account | Cannot be enabled after creation — create a new account with `--enable-hierarchical-namespace true` |
-| Container image pull fails on Batch node | Missing `AcrPull` on the pool identity, or `containerConfiguration` not set | Re-run Step 5b; verify pool has `containerConfiguration.type = DockerCompatible` |
-| `DefaultAzureCredential` picks wrong identity | Multiple managed identities on the Batch node | Set `AZURE_CLIENT_ID` env var on the pool (Step 9a) |
-| Low-priority node evicted mid-task | Azure reclaimed the spot node | ADF/Batch retries automatically; pipeline is idempotent so a re-run is safe |
-| Pool stays at 0 nodes after ADF submits task | Auto-scale evaluation interval has not elapsed yet | Wait up to 5 minutes for the pool to scale up; normal behaviour on first run |
-| Azure Data Factory cannot submit Batch jobs | Missing `Contributor` on the Azure Batch account for the factory managed identity | Re-run Step 8a |
-| Snowflake `COPY INTO` access denied | Consent or storage RBAC incomplete | Open `AZURE_CONSENT_URL` from `DESC INTEGRATION` in a browser; complete Step 11b as a Cloud Application Administrator or Global Administrator |
+| `0 functions found (Custom)` | The deployment zip used Windows backslashes in entry names | Build the zip with forward slashes; use `deploy/deploy_function_tickers.ps1` on Windows |
+| `Invalid URI: The hostname could not be parsed.` | `functionAppUrl` in the ADF linked service was empty or malformed | For Flex, query `properties.defaultHostName` and store `https://<host>` |
+| Function returns `AuthorizationPermissionMismatch` | Function App identity does not have ADLS write access | Reapply `Storage Blob Data Contributor` on the ADLS account scope |
+| ADF pipeline succeeds in authoring but fails at runtime calling the Function | Wrong function key or stale linked service secret | Refresh the linked service with the current key and publish |
+| `abfss://` write path fails | The data lake account does not have Hierarchical Namespace enabled | Recreate the data lake account with `--enable-hierarchical-namespace true` |
+| Function stage exceeds 10 minutes | The workload is too large for the current Function host timeout | Move that stage to Premium / Dedicated Functions or Azure Batch |
+| `ContainerTaskSettingsNotFound` on Batch fallback | The Batch pool was configured as a container pool but ADF submitted a plain task | Recreate the pool without `containerConfiguration` |
+
+---
+
+## Recommended Next Step
+
+Use the Function path as the default Azure Bronze ingest path for lightweight stages. Keep the Batch assets isolated as fallback infrastructure for any stage that cannot reliably finish within the Function limits.

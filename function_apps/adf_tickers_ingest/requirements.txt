@@ -1,0 +1,5 @@
+azure-functions>=1.21.0
+requests>=2.31.0
+pyarrow>=14.0.0
+adlfs>=2024.2.0
+azure-identity>=1.15.0
