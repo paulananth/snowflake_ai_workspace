@@ -32,7 +32,7 @@ set -euo pipefail
 # ┌──────────────────────────────────────────────────────────────────────────┐
 # │  CONFIG — edit these values before running                               │
 # └──────────────────────────────────────────────────────────────────────────┘
-AWS_BUCKET="my-sec-edgar-bucket"        # S3 bucket name (created if absent)
+AWS_BUCKET="paulananth11-sec-edgar-bronze"
 AWS_REGION="us-east-1"
 ECR_REPO="sec-edgar-ingest"
 ECS_CLUSTER="sec-edgar-cluster"

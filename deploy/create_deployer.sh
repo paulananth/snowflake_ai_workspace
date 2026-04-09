@@ -22,7 +22,7 @@ set -euo pipefail
 # ── Config ────────────────────────────────────────────────────────────────────
 DEPLOYER_USER="sec-loader-deployer"
 POLICY_NAME="sec-edgar-deploy-policy"
-BUCKET="my-sec-edgar-bucket"   # ← change to your S3 bucket name
+BUCKET="paulananth11-sec-edgar-bronze"
 AWS_REGION="us-east-1"
 # ─────────────────────────────────────────────────────────────────────────────
 
