@@ -25,7 +25,7 @@
           "ExecutionRoleArn": "EXEC_ROLE_ARN",
           "ContainerOverrides": [{
             "Name": "ingest",
-            "Command.$": "States.Array('python', 'scripts/ingest/01_ingest_tickers_exchange.py', '--date', $.ingestDate)",
+            "Command.$": "States.Array('scripts/ingest/01_ingest_tickers_exchange.py', '--date', $.ingestDate)",
             "Environment": [
               {"Name": "CLOUD_PROVIDER",     "Value": "aws"},
               {"Name": "AWS_BUCKET",         "Value": "AWS_BUCKET_VALUE"},
@@ -67,7 +67,7 @@
           "ExecutionRoleArn": "EXEC_ROLE_ARN",
           "ContainerOverrides": [{
             "Name": "ingest",
-            "Command.$": "States.Array('python', 'scripts/ingest/02_ingest_daily_index.py', '--date', $.ingestDate)",
+            "Command.$": "States.Array('scripts/ingest/02_ingest_daily_index.py', '--date', $.ingestDate)",
             "Environment": [
               {"Name": "CLOUD_PROVIDER",     "Value": "aws"},
               {"Name": "AWS_BUCKET",         "Value": "AWS_BUCKET_VALUE"},
@@ -110,7 +110,7 @@
           "ExecutionRoleArn": "EXEC_ROLE_ARN",
           "ContainerOverrides": [{
             "Name": "ingest",
-            "Command.$": "States.Array('python', 'scripts/ingest/03_ingest_submissions.py', '--date', $.ingestDate)",
+            "Command.$": "States.Array('scripts/ingest/03_ingest_submissions.py', '--date', $.ingestDate)",
             "Environment": [
               {"Name": "CLOUD_PROVIDER",     "Value": "aws"},
               {"Name": "AWS_BUCKET",         "Value": "AWS_BUCKET_VALUE"},
@@ -153,7 +153,7 @@
           "ExecutionRoleArn": "EXEC_ROLE_ARN",
           "ContainerOverrides": [{
             "Name": "ingest",
-            "Command.$": "States.Array('python', 'scripts/ingest/04_ingest_companyfacts.py', '--date', $.ingestDate)",
+            "Command.$": "States.Array('scripts/ingest/04_ingest_companyfacts.py', '--date', $.ingestDate)",
             "Environment": [
               {"Name": "CLOUD_PROVIDER",     "Value": "aws"},
               {"Name": "AWS_BUCKET",         "Value": "AWS_BUCKET_VALUE"},
