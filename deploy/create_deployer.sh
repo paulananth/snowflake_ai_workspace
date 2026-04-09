@@ -167,12 +167,30 @@ POLICY
 )
 
 echo ""
-echo "[3/3] Attaching inline policy: $POLICY_NAME"
-aws iam put-user-policy \
+echo "[3/3] Creating customer-managed policy and attaching to user..."
+
+# Customer-managed policies support up to 6,144 characters (vs 2,048 for inline).
+# Check if the policy already exists; if so, create a new version.
+POLICY_ARN="arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):policy/${POLICY_NAME}"
+
+if aws iam get-policy --policy-arn "$POLICY_ARN" > /dev/null 2>&1; then
+    echo "  Policy already exists — creating new version"
+    aws iam create-policy-version \
+        --policy-arn "$POLICY_ARN" \
+        --policy-document "$POLICY_DOC" \
+        --set-as-default > /dev/null
+else
+    POLICY_ARN=$(aws iam create-policy \
+        --policy-name "$POLICY_NAME" \
+        --policy-document "$POLICY_DOC" \
+        --query "Policy.Arn" --output text)
+    echo "  Policy created: $POLICY_ARN"
+fi
+
+aws iam attach-user-policy \
     --user-name "$DEPLOYER_USER" \
-    --policy-name "$POLICY_NAME" \
-    --policy-document "$POLICY_DOC"
-echo "  [OK]"
+    --policy-arn "$POLICY_ARN"
+echo "  [OK] Policy attached to $DEPLOYER_USER"
 
 # Create access key (always creates a new one — max 2 per user)
 echo ""
