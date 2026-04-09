@@ -10,12 +10,12 @@
   ],
   "name": "DailyBronzeIngestTrigger",
   "properties": {
-    "description": "Daily SEC EDGAR Bronze ingest at 06:00 UTC. Passes windowStartTime as ingestDate.",
+    "description": "Daily SEC EDGAR Bronze CDC ingest at 06:00 UTC. Passes windowStartTime as ingestDate with fullRefresh=false.",
     "type": "TumblingWindowTrigger",
     "typeProperties": {
       "frequency": "Hour",
       "interval": 24,
-      "startTime": "2026-04-08T06:00:00Z",
+      "startTime": "2026-04-09T06:00:00Z",
       "delay": "00:00:00",
       "maxConcurrency": 1,
       "retryPolicy": {
@@ -32,9 +32,10 @@
         "ingestDate": {
           "value": "@formatDateTime(trigger().outputs.windowStartTime, 'yyyy-MM-dd')",
           "type": "Expression"
-        }
+        },
+        "fullRefresh": false
       }
     },
-    "annotations": ["sec-edgar", "daily", "bronze"]
+    "annotations": ["sec-edgar", "daily", "bronze", "cdc"]
   }
 }

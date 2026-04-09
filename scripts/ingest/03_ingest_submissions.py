@@ -1,15 +1,15 @@
 """
-Ingest SEC EDGAR company submissions → bronze/submissions_meta/ + bronze/filings_index/.
+Ingest SEC EDGAR company submissions -> bronze/submissions_meta/ + bronze/filings_index/.
 
 Reads the CIK list produced by 02_ingest_daily_index.py (incremental mode) or
 directly from the tickers Parquet when --full-refresh is passed.
 
 Incremental (default): only fetches CIKs that filed something on the target date,
-typically 200-600 companies. Full-refresh: all ~5k NYSE/Nasdaq CIKs (~90 min).
+typically 200-600 companies. Full-refresh: the full ticker-snapshot universe.
 
 Produces two Parquet outputs:
-  submissions_meta  — one row per company (all Submission fields, addresses flattened)
-  filings_index     — one row per filing  (exploded from filings.recent, all fields)
+  submissions_meta - one row per company (all Submission fields, addresses flattened)
+  filings_index    - one row per filing (exploded from filings.recent, all fields)
 
 Writes batches of BATCH_SIZE CIKs to separate numbered Parquet files.
 Resume-safe: skips batches whose output files already exist (idempotent on retry).
@@ -36,11 +36,9 @@ from _http import edgar_get
 from _rate_limiter import RateLimiter
 from _batch_writer import write_parquet, read_parquet, parquet_exists
 from models import Submission, explode_filings
-
-TARGET_EXCHANGES = {"NYSE", "Nasdaq"}
 SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik10}.json"
 
-# ── PyArrow schemas ───────────────────────────────────────────────────────────
+# PyArrow schemas
 
 SUBMISSIONS_META_SCHEMA = pa.schema([
     pa.field("cik",                                 pa.string()),
@@ -104,7 +102,7 @@ FILINGS_INDEX_SCHEMA = pa.schema([
     pa.field("ingestion_date",          pa.string()),
 ])
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# Helpers
 
 _limiter = RateLimiter(rps=8.0)
 
@@ -173,8 +171,9 @@ def _fetch_one(cik10: str) -> tuple[Submission | None, list[dict]]:
 
 def _batch_path(prefix: str, ingest_date: str, batch_num: int) -> tuple[str, str]:
     label = f"batch_{batch_num:04d}.parquet"
-    meta = f"{prefix}/submissions_meta/ingestion_date={ingest_date}/{label}"
-    filings = f"{prefix}/filings_index/ingestion_date={ingest_date}/{label}"
+    bronze_prefix = f"{prefix}/bronze"
+    meta = f"{bronze_prefix}/submissions_meta/ingestion_date={ingest_date}/{label}"
+    filings = f"{bronze_prefix}/filings_index/ingestion_date={ingest_date}/{label}"
     return meta, filings
 
 
@@ -197,18 +196,18 @@ def _write_batch(
 
     print(
         f"  [batch {batch_num:04d}] "
-        f"{len(meta_records)} companies, {len(filing_rows):,} filings → saved"
+        f"{len(meta_records)} companies, {len(filing_rows):,} filings -> saved"
     )
 
 
-# ── CIK source ────────────────────────────────────────────────────────────────
+# CIK source
 
 def _load_ciks(ingest_date: str, full_refresh: bool, limit: int | None) -> list[str]:
     """
     Return the ordered list of CIK10s to process.
 
     Incremental: read from daily_index parquet (script 02 output).
-    Full-refresh: read all NYSE/Nasdaq CIKs from tickers parquet (script 01 output).
+    Full-refresh: read all ticker-snapshot CIKs from tickers parquet (script 01 output).
     """
     if full_refresh:
         tickers_path = (
@@ -219,12 +218,11 @@ def _load_ciks(ingest_date: str, full_refresh: bool, limit: int | None) -> list[
         d = tbl.to_pydict()
         seen: set[str] = set()
         ciks: list[str] = []
-        for cik_raw, exchange in zip(d["cik"], d["exchange"]):
-            if exchange in TARGET_EXCHANGES:
-                cik10 = str(int(cik_raw)).zfill(10)
-                if cik10 not in seen:
-                    seen.add(cik10)
-                    ciks.append(cik10)
+        for cik_raw in d["cik"]:
+            cik10 = str(int(cik_raw)).zfill(10)
+            if cik10 not in seen:
+                seen.add(cik10)
+                ciks.append(cik10)
     else:
         daily_path = (
             f"{settings.STORAGE_ROOT}/bronze/daily_index"
@@ -238,13 +236,13 @@ def _load_ciks(ingest_date: str, full_refresh: bool, limit: int | None) -> list[
     return ciks
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# Main
 
 def run(ingest_date: str, limit: int | None = None, full_refresh: bool = False) -> None:
     ciks = _load_ciks(ingest_date, full_refresh, limit)
 
     if not ciks:
-        print(f"[3/4] No CIKs to process for {ingest_date} — skipping")
+        print(f"[3/4] No CIKs to process for {ingest_date} - skipping")
         return
 
     mode = "full-refresh" if full_refresh else "incremental"
@@ -317,7 +315,7 @@ def main() -> None:
     parser.add_argument(
         "--full-refresh",
         action="store_true",
-        help="Process all NYSE/Nasdaq CIKs instead of only today's filers",
+        help="Process all ticker-snapshot CIKs instead of only today's filers",
     )
     args = parser.parse_args()
     # Also honour FULL_REFRESH=true env var (set by Step Functions for AWS runs)

@@ -219,7 +219,7 @@ def main() -> None:
         print(f"  Container:       {settings.AZURE_CONTAINER}")
     elif cloud == "aws":
         print(f"  S3 bucket:       {settings.AWS_BUCKET or '(not set)'}")
-        print(f"  Region:          {settings.AWS_DEFAULT_REGION or '(not set)'}")
+        print(f"  Region:          {settings.AWS_REGION or '(not set)'}")
     print(f"{'=' * 60}")
 
     results: list[tuple[str, bool, str]] = []

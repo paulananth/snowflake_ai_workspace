@@ -1,25 +1,26 @@
 """
-Fetch the SEC EDGAR daily filing index → bronze/daily_index/.
+Fetch the SEC EDGAR daily filing index -> bronze/daily_index/.
 
-This is the CDC (change data capture) step for the pipeline. Instead of fetching
-all ~10k NYSE/Nasdaq CIKs every day, scripts 03 and 04 only process the CIKs
-that actually filed something on the target date.
+This is the CDC step for the pipeline. Instead of fetching the full
+ticker-snapshot universe every day, scripts 03 and 04 only process the
+CIKs that actually filed something on the target date.
 
 Source:
-  https://www.sec.gov/Archives/edgar/daily-index/{YYYY}/QTR{N}/master{YYYYMMDD}.idx
+  https://www.sec.gov/Archives/edgar/daily-index/{YYYY}/QTR{N}/master.{YYYYMMDD}.idx
   Pipe-delimited text: CIK|Company Name|Form Type|Date Filed|Filename
 
-Behaviour:
-  Default (incremental): fetch today's daily master.idx → intersect with NYSE/Nasdaq
-  CIKs from the tickers Parquet → write changed CIKs to bronze/daily_index/.
+Behavior:
+  Default (incremental): fetch the daily master.idx and intersect with the
+  full ticker-snapshot universe from the tickers Parquet before writing changed
+  CIKs to bronze/daily_index/.
   Scripts 03 and 04 read from this output.
 
-  --full-refresh: skip the daily index; write ALL NYSE/Nasdaq CIKs to
-  bronze/daily_index/. Use for the initial bootstrap and weekly Sunday re-syncs.
+  --full-refresh: skip the daily index and write all ticker-snapshot CIKs to
+  bronze/daily_index/. Use this for the initial bootstrap and monthly re-syncs.
 
 Edge cases:
-  - Weekend / public holiday: SEC publishes no index → write empty Parquet →
-    scripts 03 and 04 detect zero CIKs and exit cleanly.
+  - Weekend or public holiday: SEC publishes no index, so write empty Parquet
+    and let scripts 03 and 04 exit cleanly.
   - Multiple filings per CIK on one day: deduplicated; forms_filed lists all types.
 
 Output:
@@ -46,8 +47,6 @@ from config import settings
 from _http import edgar_get_text
 from _batch_writer import write_parquet, read_parquet
 
-TARGET_EXCHANGES = {"NYSE", "Nasdaq"}
-
 SCHEMA = pa.schema([
     pa.field("cik",            pa.string()),   # zero-padded 10-digit string
     pa.field("company_name",   pa.string()),
@@ -65,19 +64,18 @@ def _master_idx_url(d: date) -> str:
     """Daily master.idx URL: pipe-delimited, CIK|Company Name|Form Type|Date Filed|Filename"""
     return (
         f"https://www.sec.gov/Archives/edgar/daily-index"
-        f"/{d.year}/QTR{_quarter(d)}/master{d.strftime('%Y%m%d')}.idx"
+        f"/{d.year}/QTR{_quarter(d)}/master.{d.strftime('%Y%m%d')}.idx"
     )
 
 
-def _all_nyse_nasdaq_ciks(tickers_path: str) -> dict[str, str]:
-    """Return {cik10: company_name} for all NYSE+Nasdaq CIKs."""
+def _all_ticker_universe_ciks(tickers_path: str) -> dict[str, str]:
+    """Return {cik10: company_name} for all CIKs in the ticker snapshot."""
     tickers_table = read_parquet(tickers_path)
     d = tickers_table.to_pydict()
     result: dict[str, str] = {}
-    for cik_raw, name, exchange in zip(d["cik"], d["name"], d["exchange"]):
-        if exchange in TARGET_EXCHANGES:
-            cik10 = str(int(cik_raw)).zfill(10)
-            result[cik10] = name
+    for cik_raw, name in zip(d["cik"], d["name"]):
+        cik10 = str(int(cik_raw)).zfill(10)
+        result[cik10] = name
     return result
 
 
@@ -114,7 +112,7 @@ def _parse_master_idx(text: str) -> dict[str, dict]:
     return cik_map
 
 
-def run(ingest_date: str, full_refresh: bool = False) -> None:
+def run(ingest_date: str, full_refresh: bool = False) -> str:
     out_path = (
         f"{settings.STORAGE_ROOT}/bronze/daily_index"
         f"/ingestion_date={ingest_date}/data.parquet"
@@ -127,7 +125,7 @@ def run(ingest_date: str, full_refresh: bool = False) -> None:
     print(f"[2/4] Building CIK list for {ingest_date} (full_refresh={full_refresh})")
 
     if full_refresh:
-        all_ciks = _all_nyse_nasdaq_ciks(tickers_path)
+        all_ciks = _all_ticker_universe_ciks(tickers_path)
         records = [
             {
                 "cik": cik,
@@ -138,7 +136,7 @@ def run(ingest_date: str, full_refresh: bool = False) -> None:
             }
             for cik, name in all_ciks.items()
         ]
-        print(f"  Full-refresh mode: {len(records):,} NYSE/Nasdaq CIKs")
+        print(f"  Full-refresh mode: {len(records):,} ticker-snapshot CIKs")
 
     else:
         target = date.fromisoformat(ingest_date)
@@ -154,10 +152,10 @@ def run(ingest_date: str, full_refresh: bool = False) -> None:
             cik_map = _parse_master_idx(text)
             print(f"  Daily index: {len(cik_map):,} unique CIKs filed on {ingest_date}")
 
-            # Intersect with NYSE+Nasdaq universe
-            all_nyse_nasdaq = _all_nyse_nasdaq_ciks(tickers_path)
-            matched = {cik: info for cik, info in cik_map.items() if cik in all_nyse_nasdaq}
-            print(f"  NYSE/Nasdaq intersection: {len(matched):,} CIKs")
+            # Intersect with the authoritative ticker-snapshot universe.
+            all_ticker_universe = _all_ticker_universe_ciks(tickers_path)
+            matched = {cik: info for cik, info in cik_map.items() if cik in all_ticker_universe}
+            print(f"  Ticker-snapshot intersection: {len(matched):,} CIKs")
 
             records = [
                 {
@@ -172,7 +170,8 @@ def run(ingest_date: str, full_refresh: bool = False) -> None:
 
     table = pa.Table.from_pylist(records, schema=SCHEMA)
     write_parquet(table, out_path)
-    print(f"  [OK] {len(records):,} CIKs → {out_path}")
+    print(f"  [OK] {len(records):,} CIKs -> {out_path}")
+    return out_path
 
 
 def main() -> None:
@@ -187,7 +186,7 @@ def main() -> None:
     parser.add_argument(
         "--full-refresh",
         action="store_true",
-        help="Skip daily index; process all NYSE/Nasdaq CIKs (bootstrap / weekly re-sync)",
+        help="Skip daily index; process all ticker-snapshot CIKs (bootstrap / monthly re-sync)",
     )
     args = parser.parse_args()
     # Also honour FULL_REFRESH=true env var (set by Step Functions for AWS runs)

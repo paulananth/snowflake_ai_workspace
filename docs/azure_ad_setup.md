@@ -6,19 +6,25 @@ This document describes the current Azure deployment model for the SEC EDGAR Bro
 
 ### Primary / validated path
 - Azure Data Factory (ADF) orchestrates the run
-- Azure Function Activity invokes a Python Function App
-- The Function App writes Bronze Parquet to ADLS Gen2 with its system-assigned managed identity
+- Azure Function Activity invokes a Python Function App for the lightweight CDC steps
+- Azure Batch Custom Activity executes the heavier submissions and companyfacts stages
+- The Function App and the Batch runtime both write Bronze Parquet to ADLS Gen2 with managed identity
 
-This path is validated in the repo today for the lightweight ticker ingest stage:
+This path is validated in the repo today for the mixed Bronze CDC flow:
 - `scripts/ingest/01_ingest_tickers_exchange.py`
+- `scripts/ingest/02_ingest_daily_index.py`
+- `scripts/ingest/03_ingest_submissions.py`
+- `scripts/ingest/04_ingest_companyfacts.py`
 - `function_apps/adf_tickers_ingest/`
-- `workflows/adf_linked_services_function_tickers.json`
-- `workflows/adf_pipeline_function_tickers.json`
-- `deploy/deploy_function_tickers.ps1`
+- `workflows/adf_linked_services.json`
+- `workflows/adf_pipeline.json`
+- `workflows/adf_trigger.json`
+- `workflows/adf_trigger_monthly.json`
+- `deploy/deploy.ps1`
 
 ### Fallback path
 - Use Azure Batch only for stages that exceed Function timeout or memory limits
-- Keep Batch as a separate execution model; do not mix it into the lightweight Function path
+- In the current Bronze pipeline, that means submissions and companyfacts
 
 ---
 
@@ -27,14 +33,14 @@ This path is validated in the repo today for the lightweight ticker ingest stage
 | Resource | SKU / Config | Est. Cost/month |
 |---|---|---|
 | ADLS Gen2 data lake | Standard LRS, ~15 GB, Hot -> Cool lifecycle | ~$0.40 |
-| Azure Function App | Flex Consumption, pay per execution | Low for daily ticker ingest |
+| Azure Function App | Flex Consumption, pay per execution | Low for daily ticker + daily-index CDC |
 | Function host storage | Standard LRS `StorageV2` | Low |
 | Azure Data Factory | ~1-8 activity runs/day | ~$0.05-$0.25 |
 | Azure Batch account | Optional fallback only | $0.00 for account |
 | Azure Batch compute | Optional fallback only | Varies by region/runtime |
 | Azure Container Registry | Optional / legacy | ~$5.00 only if retained |
 
-The validated ticker-only Function path does not require Azure Batch compute or ACR.
+The current mixed CDC path uses Azure Batch compute for submissions and companyfacts. ACR remains optional.
 
 ---
 
@@ -75,8 +81,8 @@ FUNCTION_HOST_STORAGE=secedgarfn$SUFFIX
 FUNCTION_APP_NAME=sec-edgar-flex-$SUFFIX
 
 ADF_NAME=mysecedgaradf
-FUNCTION_LINKED_SERVICE=AzureFunctionTickersLS
-PIPELINE_NAME=sec-edgar-function-tickers-ingest
+FUNCTION_LINKED_SERVICE=AzureFunctionBronzeLS
+PIPELINE_NAME=sec-edgar-bronze-ingest
 
 SEC_USER_AGENT="SEC EDGAR Bronze Pipeline you@example.com"
 ```
@@ -208,7 +214,10 @@ az datafactory create \
   --location $LOCATION
 ```
 
-This path does not require ADF managed identity RBAC on storage or Batch. ADF calls the Function App through the Function linked service.
+This path requires:
+- ADF system-assigned managed identity with `Contributor` on the Batch account
+- Batch user-assigned managed identity with `Storage Blob Data Contributor` on the ADLS Gen2 account
+- Function App system-assigned managed identity with `Storage Blob Data Contributor` on the ADLS Gen2 account
 
 ---
 
@@ -245,12 +254,13 @@ az functionapp config appsettings list \
 ### Supported repo path
 
 Use the checked-in deployment script:
-- `deploy/deploy_function_tickers.ps1`
+- `deploy/deploy.ps1`
 
 It packages:
 - `function_apps/adf_tickers_ingest/`
 - `config/`
 - `scripts/ingest/`
+- the Batch task bundle for `scripts/ingest/03_ingest_submissions.py` and `scripts/ingest/04_ingest_companyfacts.py`
 
 It also normalizes zip entry names before deployment. This matters on Windows.
 
@@ -277,35 +287,41 @@ az functionapp deployment source config-zip \
 From the repo root, run:
 
 ```powershell
-.\deploy\deploy_function_tickers.ps1 `
+.\deploy\deploy.ps1 `
   -SubscriptionId $env:AZURE_SUBSCRIPTION_ID `
   -ResourceGroup my-sec-edgar-rg `
   -Location eastus `
-  -DataStorageAccount mysecedgarstorage `
+  -StorageAccount mysecedgarstorage `
   -FunctionStorageAccount $env:AZURE_FUNCTION_STORAGE_ACCOUNT `
   -Container sec-edgar `
   -Prefix sec-edgar `
+  -BatchAccount mysecedgarbatch `
+  -BatchPoolId sec-edgar-pool `
   -AdfName mysecedgaradf `
   -FunctionAppName $env:AZURE_FUNCTION_APP_NAME `
-  -PipelineName sec-edgar-function-tickers-ingest `
-  -FunctionLinkedServiceName AzureFunctionTickersLS `
-  -IngestDate 2026-04-09
+  -PipelineName sec-edgar-bronze-ingest `
+  -TriggerName DailyBronzeIngestTrigger `
+  -MonthlyTriggerName MonthlyBronzeFullRefreshTrigger `
+  -FunctionLinkedServiceName AzureFunctionBronzeLS
 ```
 
 The script:
 - deploys the Function App package
+- uploads the Batch task bundle to `sec-edgar/adf-resources/sec-edgar-task.zip`
 - waits for function indexing
 - injects the Function host URL and function key into the ADF linked service template
-- creates or updates the ADF pipeline
-- can directly invoke the function for a smoke test
+- creates or updates the mixed ADF pipeline
+- creates or updates both the daily CDC trigger and the monthly full-refresh trigger
 
 ---
 
 ## Step 8 - Create the ADF Linked Service and Pipeline
 
 The repo templates are:
-- `workflows/adf_linked_services_function_tickers.json`
-- `workflows/adf_pipeline_function_tickers.json`
+- `workflows/adf_linked_services.json`
+- `workflows/adf_pipeline.json`
+- `workflows/adf_trigger.json`
+- `workflows/adf_trigger_monthly.json`
 
 ### Linked service requirements
 
@@ -330,15 +346,18 @@ Do not query `defaultHostName` at the top level for Flex. That returns the wrong
 
 ### Pipeline shape
 
-The validated pipeline is a single `AzureFunctionActivity` that POSTs:
+The validated pipeline is a mixed 4-stage Bronze CDC flow:
+1. `IngestTickersExchange` - `AzureFunctionActivity`
+2. `IngestDailyIndex` - `AzureFunctionActivity`
+3. `IngestSubmissions` - Batch `Custom` activity
+4. `IngestCompanyFacts` - Batch `Custom` activity
 
-```json
-{"ingestDate":"2026-04-09"}
-```
+The pipeline parameters are:
+- `ingestDate`
+- `fullRefresh`
 
-The Function activity in the template calls:
-- `functionName = ingest_tickers_exchange`
-- `method = POST`
+The daily trigger passes `fullRefresh=false`.
+The monthly reconciliation trigger passes `fullRefresh=true`.
 
 ---
 
@@ -354,6 +373,7 @@ az functionapp function list \
 ```
 
 Expected output includes `ingest_tickers_exchange`
+and `ingest_daily_index`
 
 ### 9b. Invoke the Function directly
 
@@ -505,8 +525,8 @@ The legacy Batch assets remain in the repo:
 | Function host URL | `https://<properties.defaultHostName>` |
 | ADF factory name | `$ADF_NAME` |
 | ADF Function linked service | `$FUNCTION_LINKED_SERVICE` |
-| ADF ticker pipeline | `$PIPELINE_NAME` |
-| Bronze ticker output path | `$PREFIX/bronze/company_tickers_exchange/ingestion_date=<date>/data.parquet` |
+| ADF Bronze CDC pipeline | `$PIPELINE_NAME` |
+| Bronze daily-index output path | `$PREFIX/bronze/daily_index/ingestion_date=<date>/data.parquet` |
 
 ---
 
@@ -514,7 +534,7 @@ The legacy Batch assets remain in the repo:
 
 | Error | Cause | Fix |
 |---|---|---|
-| `0 functions found (Custom)` | The deployment zip used Windows backslashes in entry names | Build the zip with forward slashes; use `deploy/deploy_function_tickers.ps1` on Windows |
+| `0 functions found (Custom)` | The deployment zip used Windows backslashes in entry names | Build the zip with forward slashes; use `deploy/deploy.ps1` on Windows |
 | `Invalid URI: The hostname could not be parsed.` | `functionAppUrl` in the ADF linked service was empty or malformed | For Flex, query `properties.defaultHostName` and store `https://<host>` |
 | Function returns `AuthorizationPermissionMismatch` | Function App identity does not have ADLS write access | Reapply `Storage Blob Data Contributor` on the ADLS account scope |
 | ADF pipeline succeeds in authoring but fails at runtime calling the Function | Wrong function key or stale linked service secret | Refresh the linked service with the current key and publish |

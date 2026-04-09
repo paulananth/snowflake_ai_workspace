@@ -1,12 +1,12 @@
 """
-Write (and read) PyArrow tables as Parquet — local filesystem, Azure Blob Storage, or AWS S3.
+Write and read PyArrow tables as Parquet on local filesystem, Azure Blob Storage, or AWS S3.
 
 Cloud provider is determined by config.settings.CLOUD_PROVIDER at call time.
 
 Auth:
-  local  — plain filesystem, no credentials
-  azure  — DefaultAzureCredential (az login locally; Managed Identity on Batch)
-  aws    — boto3 credential chain (env vars → ~/.aws/credentials → ECS task role)
+  local  - plain filesystem, no credentials
+  azure  - DefaultAzureCredential (az login locally; Managed Identity on Batch)
+  aws    - boto3 credential chain (env vars -> ~/.aws/credentials -> ECS task role)
 """
 import io
 import pathlib
@@ -25,7 +25,7 @@ from config import settings
 
 def _abfss_to_blob_path(abfss_path: str) -> str:
     """
-    Convert abfss://container@account.dfs.core.windows.net/rest  →  container/rest
+    Convert abfss://container@account.dfs.core.windows.net/rest -> container/rest
 
     adlfs.AzureBlobFileSystem.open() expects paths in the form
     {container}/{blob_path}, not the full abfss:// URI.
@@ -68,7 +68,7 @@ def write_parquet(table: pa.Table, path: str) -> None:
 
     if settings.CLOUD_PROVIDER == "aws":
         import s3fs
-        fs = s3fs.S3FileSystem()  # boto3 chain: env → profile → ECS task role
+        fs = s3fs.S3FileSystem()  # boto3 chain: env -> profile -> ECS task role
         buf = io.BytesIO()
         pq.write_table(table, buf, compression="snappy")
         buf.seek(0)
@@ -86,7 +86,8 @@ def read_parquet(path: str) -> pa.Table:
     Used by downstream scripts to load tables produced by the preceding script.
     """
     if settings.CLOUD_PROVIDER == "local":
-        return pq.read_table(path)
+        with open(path, "rb") as handle:
+            return pq.read_table(handle)
 
     if settings.CLOUD_PROVIDER == "azure":
         import adlfs
@@ -96,12 +97,14 @@ def read_parquet(path: str) -> pa.Table:
             credential=DefaultAzureCredential(),
         )
         blob_path = _abfss_to_blob_path(path)
-        return pq.read_table(blob_path, filesystem=fs)
+        with fs.open(blob_path, "rb") as handle:
+            return pq.read_table(handle)
 
     if settings.CLOUD_PROVIDER == "aws":
         import s3fs
         fs = s3fs.S3FileSystem()
-        return pq.read_table(path, filesystem=fs)
+        with fs.open(path, "rb") as handle:
+            return pq.read_table(handle)
 
     raise ValueError(f"Unknown CLOUD_PROVIDER: {settings.CLOUD_PROVIDER!r}")
 

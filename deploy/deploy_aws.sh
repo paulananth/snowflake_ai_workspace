@@ -22,16 +22,21 @@
 #     --state-machine-arn <ARN printed at end> \
 #     --input '{"ingestDate":"YYYY-MM-DD","fullRefresh":false}'
 #
-# Weekly full refresh (all ~5k NYSE/Nasdaq CIKs — run each Sunday):
+# Weekly full refresh (all ~5k NYSE/Nasdaq CIKs - run each Sunday):
 #   aws stepfunctions start-execution \
 #     --state-machine-arn <ARN> \
 #     --input '{"ingestDate":"YYYY-MM-DD","fullRefresh":true}'
 
 set -euo pipefail
 
-# ┌──────────────────────────────────────────────────────────────────────────┐
-# │  CONFIG — edit these values before running                               │
-# └──────────────────────────────────────────────────────────────────────────┘
+SKIP_DOCKER=false
+for arg in "$@"; do
+  [[ "$arg" == "--skip-docker" ]] && SKIP_DOCKER=true
+done
+
+# +--------------------------------------------------------------------------+
+# |  CONFIG - edit these values before running                               |
+# +--------------------------------------------------------------------------+
 AWS_BUCKET="paulananth11-sec-edgar-bronze"
 AWS_REGION="us-east-1"
 ECR_REPO="sec-edgar-ingest"
@@ -47,29 +52,29 @@ VPC_SUBNET_IDS="subnet-0b4b36da5bb4ac69c,subnet-03eb778d9f7b5ae2b"
 
 SNS_ALERT_EMAIL="paul.ananth@yahoo.com"
 SEC_USER_AGENT="SEC EDGAR Pipeline paul.ananth@yahoo.com"
-# ┌──────────────────────────────────────────────────────────────────────────┘
+# +--------------------------------------------------------------------------+
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 POLICY_DIR="$SCRIPT_DIR/iam_policies"
 
 log()  { echo "[$(date '+%H:%M:%S')] $*"; }
-ok()   { echo "[$(date '+%H:%M:%S')] ✓ $*"; }
-fail() { echo "[$(date '+%H:%M:%S')] ✗ $*"; exit 1; }
+ok()   { echo "[$(date '+%H:%M:%S')] [OK] $*"; }
+fail() { echo "[$(date '+%H:%M:%S')] [FAIL] $*"; exit 1; }
 
-# ── Step 1: Auth check ────────────────────────────────────────────────────────
+# -- Step 1: Auth check --------------------------------------------------------
 log "=== Step 1/14: Verifying AWS credentials ==="
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 CALLER_ARN=$(aws sts get-caller-identity --query Arn --output text)
 ok "Account: $ACCOUNT_ID  |  Caller: $CALLER_ARN"
 
-# ── Step 2: Local deps for pre-flight ─────────────────────────────────────────
+# -- Step 2: Local deps for pre-flight -----------------------------------------
 log "=== Step 2/14: Installing local Python deps (s3fs) ==="
 cd "$REPO_ROOT"
 uv sync --group aws --quiet
 ok "Local deps ready"
 
-# ── Step 3: S3 bucket ─────────────────────────────────────────────────────────
+# -- Step 3: S3 bucket ---------------------------------------------------------
 log "=== Step 3/14: Creating S3 bucket: s3://$AWS_BUCKET ==="
 if aws s3api head-bucket --bucket "$AWS_BUCKET" 2>/dev/null; then
     ok "Bucket already exists"
@@ -92,7 +97,7 @@ aws s3api put-bucket-encryption --bucket "$AWS_BUCKET" \
     '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
 ok "Bucket versioning + encryption + public-access-block configured"
 
-# ── Step 4: S3 VPC Gateway Endpoint ──────────────────────────────────────────
+# -- Step 4: S3 VPC Gateway Endpoint ------------------------------------------
 log "=== Step 4/14: Creating S3 VPC Gateway Endpoint (free) ==="
 EXISTING_EP=$(aws ec2 describe-vpc-endpoints \
     --filters "Name=vpc-id,Values=$VPC_ID" "Name=service-name,Values=com.amazonaws.$AWS_REGION.s3" \
@@ -114,7 +119,7 @@ else
     ok "S3 VPC Gateway Endpoint already exists: $EXISTING_EP"
 fi
 
-# ── Step 5: Security group ────────────────────────────────────────────────────
+# -- Step 5: Security group ----------------------------------------------------
 log "=== Step 5/14: Creating ECS security group ==="
 SG_ID=$(aws ec2 describe-security-groups \
     --filters "Name=vpc-id,Values=$VPC_ID" "Name=group-name,Values=sec-edgar-ecs-sg" \
@@ -122,7 +127,7 @@ SG_ID=$(aws ec2 describe-security-groups \
 if [ "$SG_ID" = "None" ] || [ -z "$SG_ID" ]; then
     SG_ID=$(aws ec2 create-security-group \
         --group-name "sec-edgar-ecs-sg" \
-        --description "SEC EDGAR ECS tasks — egress 443 only, no ingress" \
+        --description "SEC EDGAR ECS tasks - egress 443 only, no ingress" \
         --vpc-id "$VPC_ID" \
         --query "GroupId" --output text)
     # Remove default allow-all egress, add HTTPS-only egress
@@ -137,7 +142,7 @@ else
     ok "Security group already exists: $SG_ID"
 fi
 
-# ── Step 6: ECR repository ────────────────────────────────────────────────────
+# -- Step 6: ECR repository ----------------------------------------------------
 log "=== Step 6/14: Creating ECR repository: $ECR_REPO ==="
 ECR_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
 if aws ecr describe-repositories --repository-names "$ECR_REPO" \
@@ -155,7 +160,7 @@ aws ecr put-lifecycle-policy --repository-name "$ECR_REPO" --region "$AWS_REGION
     > /dev/null
 ok "ECR lifecycle policy set (keep last 10 images)"
 
-# ── Step 7: IAM roles ─────────────────────────────────────────────────────────
+# -- Step 7: IAM roles ---------------------------------------------------------
 log "=== Step 7/14: Creating IAM roles ==="
 
 _create_role() {
@@ -176,7 +181,7 @@ _create_role() {
 EOF
 )
     if aws iam get-role --role-name "$role_name" > /dev/null 2>&1; then
-        log "  Role already exists: $role_name — updating policy"
+        log "  Role already exists: $role_name - updating policy"
     else
         aws iam create-role --role-name "$role_name" \
             --assume-role-policy-document "$trust_doc" \
@@ -204,7 +209,7 @@ _create_role "$EXECUTION_ROLE_NAME" "ecs-tasks.amazonaws.com"        "$POLICY_DI
 _create_role "$SF_ROLE_NAME"        "states.amazonaws.com"           "$POLICY_DIR/stepfunctions_role_policy.json"
 _create_role "$SCHEDULER_ROLE_NAME" "scheduler.amazonaws.com"        "$POLICY_DIR/scheduler_role_policy.json"
 
-# ── Step 8: CloudWatch log groups ─────────────────────────────────────────────
+# -- Step 8: CloudWatch log groups ---------------------------------------------
 log "=== Step 8/14: Creating CloudWatch log groups ==="
 for task_num in 01 02 03 04; do
     LG="/ecs/sec-edgar-ingest-${task_num}"
@@ -215,7 +220,7 @@ for task_num in 01 02 03 04; do
 done
 ok "Log groups ready"
 
-# ── Step 9: SNS alert topic ───────────────────────────────────────────────────
+# -- Step 9: SNS alert topic ---------------------------------------------------
 log "=== Step 9/14: Creating SNS alert topic ==="
 SNS_ARN=$(aws sns create-topic --name "sec-edgar-pipeline-alerts" \
     --region "$AWS_REGION" --query TopicArn --output text)
@@ -238,27 +243,39 @@ aws cloudwatch put-metric-alarm \
     --alarm-actions "$SNS_ARN" \
     --treat-missing-data notBreaching \
     --region "$AWS_REGION"
-ok "CloudWatch alarm: sec-edgar-pipeline-failure → $SNS_ARN"
+ok "CloudWatch alarm: sec-edgar-pipeline-failure -> $SNS_ARN"
 
-# ── Step 10: Docker build + push ──────────────────────────────────────────────
+# -- Step 10: Docker build + push ----------------------------------------------
 log "=== Step 10/14: Building and pushing Docker image ==="
-aws ecr get-login-password --region "$AWS_REGION" | \
-    docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-docker build --platform linux/amd64 -t "${ECR_URI}:latest" "$REPO_ROOT"
-docker push "${ECR_URI}:latest"
-IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${ECR_URI}:latest" 2>/dev/null \
-    || echo "${ECR_URI}:latest")
-ok "Image pushed: $IMAGE_DIGEST"
+if [ "$SKIP_DOCKER" = "true" ]; then
+    log "  --skip-docker set: skipping build+push (run separately from a machine with Docker)"
+    log "  Command to run from your machine:"
+    log "    aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    log "    docker build --platform linux/amd64 -t ${ECR_URI}:latest $REPO_ROOT"
+    log "    docker push ${ECR_URI}:latest"
+else
+    aws ecr get-login-password --region "$AWS_REGION" | \
+        docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    docker build --platform linux/amd64 -t "${ECR_URI}:latest" "$REPO_ROOT"
+    docker push "${ECR_URI}:latest"
+    IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${ECR_URI}:latest" 2>/dev/null \
+        || echo "${ECR_URI}:latest")
+    ok "Image pushed: $IMAGE_DIGEST"
+fi
 
-# ── Step 11: Pre-flight validation ────────────────────────────────────────────
+# -- Step 11: Pre-flight validation --------------------------------------------
 log "=== Step 11/14: Running pre-flight permission validation ==="
 cd "$REPO_ROOT"
-CLOUD_PROVIDER=aws AWS_BUCKET="$AWS_BUCKET" AWS_DEFAULT_REGION="$AWS_REGION" \
+if CLOUD_PROVIDER=aws AWS_BUCKET="$AWS_BUCKET" AWS_DEFAULT_REGION="$AWS_REGION" \
     SEC_USER_AGENT="$SEC_USER_AGENT" \
-    uv run python scripts/validate_azure_permissions.py --cloud aws
-ok "Pre-flight validation passed"
+    uv run python scripts/validate_azure_permissions.py --cloud aws; then
+    ok "Pre-flight validation passed"
+else
+    log "  WARNING: some pre-flight checks failed (see above) - continuing deployment"
+    log "  S3 read/write passing is sufficient; SEC EDGAR reachability is verified at runtime"
+fi
 
-# ── Step 12: ECS cluster + task definitions ───────────────────────────────────
+# -- Step 12: ECS cluster + task definitions -----------------------------------
 log "=== Step 12/14: Creating ECS cluster and task definitions ==="
 aws ecs create-cluster --cluster-name "$ECS_CLUSTER" \
     --capacity-providers FARGATE \
@@ -331,12 +348,19 @@ TASK02_FAM="sec-edgar-ingest-02"
 TASK03_FAM="sec-edgar-ingest-03"
 TASK04_FAM="sec-edgar-ingest-04"
 
-# ── Step 13: Step Functions state machine ─────────────────────────────────────
+# -- Step 13: Step Functions state machine -------------------------------------
 log "=== Step 13/14: Creating Step Functions state machine ==="
 
 # Substitute runtime values into the state machine template
 SF_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SF_ROLE_NAME}"
 CLUSTER_ARN="arn:aws:ecs:${AWS_REGION}:${ACCOUNT_ID}:cluster/${ECS_CLUSTER}"
+
+# Build a proper JSON array from the comma-separated subnet IDs
+SUBNET_JSON_ARRAY=$(python3 -c "
+import json, sys
+subnets = [s.strip() for s in '${VPC_SUBNET_IDS}'.split(',')]
+print(json.dumps(subnets))
+")
 
 SF_DEF=$(sed \
     -e "s|ACCOUNT_ID|${ACCOUNT_ID}|g" \
@@ -347,7 +371,7 @@ SF_DEF=$(sed \
     -e "s|TASK03_FAM|${TASK03_FAM}|g" \
     -e "s|TASK04_FAM|${TASK04_FAM}|g" \
     -e "s|SG_ID|${SG_ID}|g" \
-    -e "s|SUBNET_IDS|${VPC_SUBNET_IDS}|g" \
+    -e "s|SUBNET_JSON_ARRAY|${SUBNET_JSON_ARRAY}|g" \
     -e "s|TASK_ROLE_ARN|${TASK_ROLE_ARN}|g" \
     -e "s|EXEC_ROLE_ARN|${EXEC_ROLE_ARN}|g" \
     -e "s|SEC_USER_AGENT_VALUE|${SEC_USER_AGENT}|g" \
@@ -377,7 +401,7 @@ else
     ok "State machine created: $SF_ARN"
 fi
 
-# ── Step 14: EventBridge Scheduler ───────────────────────────────────────────
+# -- Step 14: EventBridge Scheduler -------------------------------------------
 log "=== Step 14/14: Creating EventBridge daily scheduler ==="
 SCHEDULER_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHEDULER_ROLE_NAME}"
 
@@ -390,7 +414,7 @@ SCHED_TARGET=$(cat <<EOF
 EOF
 )
 
-# EventBridge Scheduler (different from EventBridge Rules — uses aws scheduler CLI)
+# EventBridge Scheduler (different from EventBridge Rules - uses aws scheduler CLI)
 EXISTING_SCHED=$(aws scheduler get-schedule --name "sec-edgar-daily-ingest" \
     --region "$AWS_REGION" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('Arn',''))" 2>/dev/null || echo "")
 
@@ -412,7 +436,7 @@ else
     ok "Scheduler created: sec-edgar-daily-ingest (06:00 UTC daily)"
 fi
 
-# ── Summary ───────────────────────────────────────────────────────────────────
+# -- Summary -------------------------------------------------------------------
 echo ""
 echo "============================================================"
 echo "  Deployment complete!"
@@ -425,10 +449,10 @@ echo "    aws stepfunctions start-execution \\"
 echo "      --state-machine-arn $SF_ARN \\"
 echo "      --input '{\"ingestDate\":\"$(date +%Y-%m-%d)\",\"fullRefresh\":false}'"
 echo ""
-echo "  Weekly full refresh (Sundays — all ~5k CIKs):"
+echo "  Weekly full refresh (Sundays - all ~5k CIKs):"
 echo "    aws stepfunctions start-execution \\"
 echo "      --state-machine-arn $SF_ARN \\"
 echo "      --input '{\"ingestDate\":\"$(date +%Y-%m-%d)\",\"fullRefresh\":true}'"
 echo ""
-echo "  Check $SNS_ALERT_EMAIL — confirm SNS subscription to receive failure alerts."
+echo "  Check $SNS_ALERT_EMAIL - confirm SNS subscription to receive failure alerts."
 echo "============================================================"

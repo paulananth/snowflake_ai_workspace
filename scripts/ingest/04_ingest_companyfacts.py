@@ -1,14 +1,13 @@
 """
-Ingest SEC EDGAR XBRL company facts → bronze/companyfacts/.
+Ingest SEC EDGAR XBRL company facts -> bronze/companyfacts/.
 
 Reads the CIK list produced by 02_ingest_daily_index.py (incremental mode) or
 directly from the tickers Parquet when --full-refresh is passed.
 
 Incremental (default): only fetches CIKs that filed something on the target date,
-typically 200-600 companies. Full-refresh: all ~5k NYSE/Nasdaq CIKs (~90 min).
+typically 200-600 companies. Full-refresh: the full ticker-snapshot universe.
 
-ALL namespaces (us-gaap, dei, ifrs-full, ...), ALL concepts — no filter.
-This is the raw Bronze layer: every tagged XBRL value from every filing.
+All namespaces and all concepts are kept. This is the raw Bronze layer.
 
 Sequential fetching (not parallel): companyfacts payloads are 5-15 MB each;
 parallelism adds memory pressure without meaningful throughput gain at 8 req/s.
@@ -17,7 +16,7 @@ Resume-safe: skips batches whose output files already exist (idempotent on retry
 
 Output:
   {STORAGE_ROOT}/bronze/companyfacts/ingestion_date={date}/batch_NNNN.parquet
-  Each batch file contains CIKS_PER_BATCH companies' worth of fact rows.
+  Each batch file contains CIKS_PER_BATCH companies worth of fact rows.
 
 Usage:
   python scripts/ingest/04_ingest_companyfacts.py [--date YYYY-MM-DD] [--limit N]
@@ -39,8 +38,6 @@ from _http import edgar_get
 from _rate_limiter import RateLimiter
 from _batch_writer import write_parquet, read_parquet, parquet_exists
 from models import CompanyFacts, explode_facts
-
-TARGET_EXCHANGES = {"NYSE", "Nasdaq"}
 FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik10}.json"
 
 # Flush a Parquet file every N CIKs.
@@ -56,7 +53,7 @@ COMPANYFACTS_SCHEMA = pa.schema([
     pa.field("unit",            pa.string()),   # "USD" | "shares" | "pure" | ...
     pa.field("end",             pa.string()),
     pa.field("start",           pa.string()),   # null for instant (balance sheet) facts
-    pa.field("val",             pa.float64()),  # Decimal → float64
+    pa.field("val",             pa.float64()),  # Decimal -> float64
     pa.field("accn",            pa.string()),
     pa.field("form",            pa.string()),
     pa.field("filed",           pa.string()),
@@ -92,17 +89,17 @@ def _write_batch(rows: list[dict], batch_num: int, ingest_date: str) -> None:
     path = _batch_path(ingest_date, batch_num)
     table = pa.Table.from_pylist(rows, schema=COMPANYFACTS_SCHEMA)
     write_parquet(table, path)
-    print(f"  [batch {batch_num:04d}] {len(rows):,} fact rows → saved")
+    print(f"  [batch {batch_num:04d}] {len(rows):,} fact rows -> saved")
 
 
-# ── CIK source ────────────────────────────────────────────────────────────────
+# CIK source
 
 def _load_ciks(ingest_date: str, full_refresh: bool, limit: int | None) -> list[str]:
     """
     Return the ordered list of CIK10s to process.
 
     Incremental: read from daily_index parquet (script 02 output).
-    Full-refresh: read all NYSE/Nasdaq CIKs from tickers parquet (script 01 output).
+    Full-refresh: read all ticker-snapshot CIKs from tickers parquet (script 01 output).
     """
     if full_refresh:
         tickers_path = (
@@ -113,12 +110,11 @@ def _load_ciks(ingest_date: str, full_refresh: bool, limit: int | None) -> list[
         d = tbl.to_pydict()
         seen: set[str] = set()
         ciks: list[str] = []
-        for cik_raw, exchange in zip(d["cik"], d["exchange"]):
-            if exchange in TARGET_EXCHANGES:
-                cik10 = str(int(cik_raw)).zfill(10)
-                if cik10 not in seen:
-                    seen.add(cik10)
-                    ciks.append(cik10)
+        for cik_raw in d["cik"]:
+            cik10 = str(int(cik_raw)).zfill(10)
+            if cik10 not in seen:
+                seen.add(cik10)
+                ciks.append(cik10)
     else:
         daily_path = (
             f"{settings.STORAGE_ROOT}/bronze/daily_index"
@@ -132,13 +128,13 @@ def _load_ciks(ingest_date: str, full_refresh: bool, limit: int | None) -> list[
     return ciks
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# Main
 
 def run(ingest_date: str, limit: int | None = None, full_refresh: bool = False) -> None:
     ciks = _load_ciks(ingest_date, full_refresh, limit)
 
     if not ciks:
-        print(f"[4/4] No CIKs to process for {ingest_date} — skipping")
+        print(f"[4/4] No CIKs to process for {ingest_date} - skipping")
         return
 
     mode = "full-refresh" if full_refresh else "incremental"
@@ -206,7 +202,7 @@ def main() -> None:
     parser.add_argument(
         "--full-refresh",
         action="store_true",
-        help="Process all NYSE/Nasdaq CIKs instead of only today's filers",
+        help="Process all ticker-snapshot CIKs instead of only today's filers",
     )
     args = parser.parse_args()
     # Also honour FULL_REFRESH=true env var (set by Step Functions for AWS runs)

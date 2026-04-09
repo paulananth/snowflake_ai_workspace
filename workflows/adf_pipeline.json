@@ -1,7 +1,10 @@
 {
   "_comment": [
     "ADF pipeline definition for the SEC EDGAR Bronze ingest.",
-    "3 activities run sequentially: tickers -> submissions -> facts.",
+    "4 activities run sequentially: tickers -> daily index -> submissions -> company facts.",
+    "",
+    "The first two activities use Azure Function Activity for lightweight steps.",
+    "The heavier submissions and companyfacts stages use Azure Batch Custom Activity.",
     "",
     "Import via: ADF Studio -> Author -> Pipelines -> ... -> Import from JSON.",
     "Or deploy via az CLI:",
@@ -11,71 +14,94 @@
     "    --name sec-edgar-bronze-ingest \\",
     "    --pipeline @workflows/adf_pipeline.json",
     "",
-    "deploy/deploy.ps1 injects the live host-executed Custom Activity command",
-    "at deploy time. That command unpacks sec-edgar-task.zip from Blob staging,",
-    "creates the uv-managed virtualenv on the Batch node, and runs the target",
-    "Python script on the VM host (not inside a container).",
+    "deploy/deploy.ps1 injects the live Azure Batch host-executed command",
+    "for the submissions and companyfacts activities at deploy time.",
+    "Those commands unpack sec-edgar-task.zip from Blob staging, create the",
+    "uv-managed virtualenv on the Batch node, and run the target Python script",
+    "on the VM host (not inside a container).",
+    "",
     "AzureStorageLS is account-scoped, so folderPath must include the",
     "filesystem/container name: sec-edgar/adf-resources.",
-    "The checked-in command values below are readable placeholders only.",
-    "Manual imports must update the command values, SEC_USER_AGENT, storage",
-    "account, container, prefix, and managed identity client ID.",
-    "",
-    "Timeouts are generous to accommodate full NYSE+Nasdaq runs:",
-    "  IngestTickersExchange:  30 minutes",
-    "  IngestSubmissions    :   4 hours   (~10k CIKs at 8 req/s with 4 workers)",
-    "  IngestCompanyFacts   :   8 hours   (~10k CIKs sequential at 8 req/s)"
+    "The checked-in command values below are readable placeholders only."
   ],
   "name": "sec-edgar-bronze-ingest",
   "properties": {
-    "description": "Daily SEC EDGAR Bronze layer: ticker snapshot -> submissions -> XBRL facts",
+    "description": "Daily SEC EDGAR Bronze layer: ticker snapshot -> daily index CDC -> submissions -> XBRL facts",
     "parameters": {
       "ingestDate": {
         "type": "string",
-        "defaultValue": "2026-04-08",
-        "description": "Partition date (YYYY-MM-DD). Set by DailyBronzeIngestTrigger; override for backfill."
+        "defaultValue": "2026-04-09",
+        "description": "Partition date (YYYY-MM-DD). Set by the ADF triggers; override for backfill."
+      },
+      "fullRefresh": {
+        "type": "Bool",
+        "defaultValue": false,
+        "description": "False for daily CDC runs. True for monthly reconciliation against the full ticker universe."
       }
     },
     "activities": [
       {
         "name": "IngestTickersExchange",
-        "description": "Fetch full SEC ticker-exchange snapshot -> bronze/company_tickers_exchange/",
-        "type": "Custom",
+        "description": "Fetch the full SEC ticker-exchange snapshot across all exchanges -> bronze/company_tickers_exchange/",
+        "type": "AzureFunctionActivity",
         "dependsOn": [],
         "policy": {
-          "timeout": "0.00:30:00",
-          "retry": 1,
-          "retryIntervalInSeconds": 300,
+          "timeout": "0.00:15:00",
+          "retry": 2,
+          "retryIntervalInSeconds": 120,
           "secureOutput": false,
           "secureInput": false
         },
         "typeProperties": {
-          "command": {
-            "value": "@concat('python scripts/ingest/01_ingest_tickers_exchange.py --date ', pipeline().parameters.ingestDate)",
-            "type": "Expression"
-          },
-          "resourceLinkedService": {
-            "referenceName": "AzureStorageLS",
-            "type": "LinkedServiceReference"
-          },
-          "folderPath": "sec-edgar/adf-resources",
-          "referenceObjects": {
-            "linkedServices": [],
-            "datasets": []
+          "functionName": "ingest_tickers_exchange",
+          "method": "POST",
+          "body": {
+            "type": "Expression",
+            "value": "@concat('{\"ingestDate\":\"', pipeline().parameters.ingestDate, '\"}')"
           }
         },
         "linkedServiceName": {
-          "referenceName": "AzureBatchLS",
+          "referenceName": "AzureFunctionBronzeLS",
+          "type": "LinkedServiceReference"
+        }
+      },
+      {
+        "name": "IngestDailyIndex",
+        "description": "Fetch SEC master.idx, intersect with the full ticker universe, and write changed CIKs -> bronze/daily_index/",
+        "type": "AzureFunctionActivity",
+        "dependsOn": [
+          {
+            "activity": "IngestTickersExchange",
+            "dependencyConditions": ["Succeeded"]
+          }
+        ],
+        "policy": {
+          "timeout": "0.00:15:00",
+          "retry": 2,
+          "retryIntervalInSeconds": 120,
+          "secureOutput": false,
+          "secureInput": false
+        },
+        "typeProperties": {
+          "functionName": "ingest_daily_index",
+          "method": "POST",
+          "body": {
+            "type": "Expression",
+            "value": "@concat('{\"ingestDate\":\"', pipeline().parameters.ingestDate, '\",\"fullRefresh\":', if(pipeline().parameters.fullRefresh, 'true', 'false'), '}')"
+          }
+        },
+        "linkedServiceName": {
+          "referenceName": "AzureFunctionBronzeLS",
           "type": "LinkedServiceReference"
         }
       },
       {
         "name": "IngestSubmissions",
-        "description": "Bulk CIK submissions (NYSE+Nasdaq) -> bronze/submissions_meta/ + bronze/filings_index/",
+        "description": "Incremental SEC submissions for changed CIKs, or full refresh for the full ticker universe -> bronze/submissions_meta/ + bronze/filings_index/",
         "type": "Custom",
         "dependsOn": [
           {
-            "activity": "IngestTickersExchange",
+            "activity": "IngestDailyIndex",
             "dependencyConditions": ["Succeeded"]
           }
         ],
@@ -88,7 +114,7 @@
         },
         "typeProperties": {
           "command": {
-            "value": "@concat('python scripts/ingest/02_ingest_submissions.py --date ', pipeline().parameters.ingestDate)",
+            "value": "@concat('python scripts/ingest/03_ingest_submissions.py --date ', pipeline().parameters.ingestDate)",
             "type": "Expression"
           },
           "resourceLinkedService": {
@@ -108,7 +134,7 @@
       },
       {
         "name": "IngestCompanyFacts",
-        "description": "Bulk XBRL facts (all namespaces, all concepts) -> bronze/companyfacts/",
+        "description": "Incremental raw XBRL companyfacts for changed CIKs, or full refresh for the full ticker universe -> bronze/companyfacts/",
         "type": "Custom",
         "dependsOn": [
           {
@@ -125,7 +151,7 @@
         },
         "typeProperties": {
           "command": {
-            "value": "@concat('python scripts/ingest/03_ingest_companyfacts.py --date ', pipeline().parameters.ingestDate)",
+            "value": "@concat('python scripts/ingest/04_ingest_companyfacts.py --date ', pipeline().parameters.ingestDate)",
             "type": "Expression"
           },
           "resourceLinkedService": {
@@ -144,6 +170,6 @@
         }
       }
     ],
-    "annotations": ["sec-edgar", "bronze", "ingest"]
+    "annotations": ["sec-edgar", "bronze", "ingest", "cdc"]
   }
 }

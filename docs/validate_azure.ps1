@@ -17,7 +17,10 @@ param(
     [string]$ResourceGroup = $(if ($env:AZURE_RESOURCE_GROUP) { $env:AZURE_RESOURCE_GROUP } else { "my-sec-edgar-rg" }),
     [string]$ManagedIdentity = $(if ($env:AZURE_MANAGED_IDENTITY_NAME) { $env:AZURE_MANAGED_IDENTITY_NAME } else { "sec-edgar-ingest-identity" }),
     [string]$PipelineName = $(if ($env:ADF_PIPELINE_NAME) { $env:ADF_PIPELINE_NAME } else { "sec-edgar-bronze-ingest" }),
-    [string]$TriggerName = $(if ($env:ADF_TRIGGER_NAME) { $env:ADF_TRIGGER_NAME } else { "DailyBronzeIngestTrigger" })
+    [string]$TriggerName = $(if ($env:ADF_TRIGGER_NAME) { $env:ADF_TRIGGER_NAME } else { "DailyBronzeIngestTrigger" }),
+    [string]$MonthlyTriggerName = $(if ($env:ADF_MONTHLY_TRIGGER_NAME) { $env:ADF_MONTHLY_TRIGGER_NAME } else { "MonthlyBronzeFullRefreshTrigger" }),
+    [string]$FunctionAppName = $(if ($env:AZURE_FUNCTION_APP_NAME) { $env:AZURE_FUNCTION_APP_NAME } else { "" }),
+    [string]$FunctionLinkedServiceName = $(if ($env:ADF_FUNCTION_LINKED_SERVICE_NAME) { $env:ADF_FUNCTION_LINKED_SERVICE_NAME } else { "AzureFunctionBronzeLS" })
 )
 
 & (Join-Path $PSScriptRoot "validate_azure_hardened.ps1") @PSBoundParameters

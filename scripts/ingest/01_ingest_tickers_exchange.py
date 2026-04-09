@@ -1,8 +1,8 @@
 """
-Ingest SEC EDGAR ticker-exchange snapshot → bronze/company_tickers_exchange/.
+Ingest SEC EDGAR ticker-exchange snapshot -> bronze/company_tickers_exchange/.
 
 Fetches https://www.sec.gov/files/company_tickers_exchange.json (one HTTP call).
-Writes ALL rows — no exchange filter — as raw Bronze.
+Writes all rows with no exchange filter as raw Bronze output.
 
 Output:
   {STORAGE_ROOT}/bronze/company_tickers_exchange/ingestion_date={date}/data.parquet
@@ -43,7 +43,7 @@ def run(ingest_date: str) -> str:
         f"/ingestion_date={ingest_date}/data.parquet"
     )
 
-    # Idempotency guard (local only — Azure writes are always safe to overwrite)
+    # Idempotency guard (local only - Azure writes are always safe to overwrite).
     if settings.CLOUD_PROVIDER == "local" and pathlib.Path(out_path).exists():
         print(f"[SKIP] {out_path} already exists")
         return out_path
@@ -59,7 +59,7 @@ def run(ingest_date: str) -> str:
 
     table = pa.Table.from_pylist(records, schema=SCHEMA)
     write_parquet(table, out_path)
-    print(f"  [OK] {len(records):,} rows → {out_path}")
+    print(f"  [OK] {len(records):,} rows -> {out_path}")
     return out_path
 
 

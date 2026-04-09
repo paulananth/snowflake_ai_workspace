@@ -11,6 +11,7 @@
 param(
     [string]$SubscriptionId = $(if ($env:AZURE_SUBSCRIPTION_ID) { $env:AZURE_SUBSCRIPTION_ID } else { "" }),
     [string]$ResourceGroup = $(if ($env:AZURE_RESOURCE_GROUP) { $env:AZURE_RESOURCE_GROUP } else { "my-sec-edgar-rg" }),
+    [string]$Location = $(if ($env:AZURE_LOCATION) { $env:AZURE_LOCATION } else { "eastus" }),
     [string]$StorageAccount = $(if ($env:AZURE_STORAGE_ACCOUNT) { $env:AZURE_STORAGE_ACCOUNT } else { "mysecedgarstorage" }),
     [string]$Container = $(if ($env:AZURE_CONTAINER) { $env:AZURE_CONTAINER } else { "sec-edgar" }),
     [string]$Prefix = $(if ($env:STORAGE_PREFIX) { $env:STORAGE_PREFIX } else { "sec-edgar" }),
@@ -21,6 +22,10 @@ param(
     [string]$ManagedIdentity = $(if ($env:AZURE_MANAGED_IDENTITY_NAME) { $env:AZURE_MANAGED_IDENTITY_NAME } else { "sec-edgar-ingest-identity" }),
     [string]$PipelineName = $(if ($env:ADF_PIPELINE_NAME) { $env:ADF_PIPELINE_NAME } else { "sec-edgar-bronze-ingest" }),
     [string]$TriggerName = $(if ($env:ADF_TRIGGER_NAME) { $env:ADF_TRIGGER_NAME } else { "DailyBronzeIngestTrigger" }),
+    [string]$MonthlyTriggerName = $(if ($env:ADF_MONTHLY_TRIGGER_NAME) { $env:ADF_MONTHLY_TRIGGER_NAME } else { "MonthlyBronzeFullRefreshTrigger" }),
+    [string]$FunctionAppName = $(if ($env:AZURE_FUNCTION_APP_NAME) { $env:AZURE_FUNCTION_APP_NAME } else { "" }),
+    [string]$FunctionStorageAccount = $(if ($env:AZURE_FUNCTION_STORAGE_ACCOUNT) { $env:AZURE_FUNCTION_STORAGE_ACCOUNT } else { "" }),
+    [string]$FunctionLinkedServiceName = $(if ($env:ADF_FUNCTION_LINKED_SERVICE_NAME) { $env:ADF_FUNCTION_LINKED_SERVICE_NAME } else { "AzureFunctionBronzeLS" }),
     [string]$AzConfigDir = $(if ($env:AZURE_CONFIG_DIR) { $env:AZURE_CONFIG_DIR } else { (Join-Path (Split-Path $PSScriptRoot -Parent) ".azure-cli") }),
     [switch]$BuildLegacyDockerArtifact,
     [switch]$RefreshBatchPool,

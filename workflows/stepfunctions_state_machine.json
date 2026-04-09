@@ -1,12 +1,12 @@
 {
-  "Comment": "SEC EDGAR Bronze ingest — 4 sequential ECS Fargate tasks. Incremental by default (only CIKs that filed today); set fullRefresh:true for full scan of all ~5k NYSE/Nasdaq CIKs. Input: {\"ingestDate\": \"YYYY-MM-DD\", \"fullRefresh\": false}",
+  "Comment": "SEC EDGAR Bronze ingest - 4 sequential ECS Fargate tasks. Incremental by default (only CIKs that filed today); set fullRefresh:true for full scan of all ~5k NYSE/Nasdaq CIKs. Input: {\"ingestDate\": \"YYYY-MM-DD\", \"fullRefresh\": false}",
   "StartAt": "IngestTickersExchange",
   "States": {
 
     "IngestTickersExchange": {
       "Type": "Task",
       "Comment": "Script 01: fetch company_tickers_exchange.json snapshot (1 HTTP call, ~10k rows)",
-      "Resource": "arn:aws:states:::ecs:runTask.sync:2",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
       "TimeoutSeconds": 900,
       "HeartbeatSeconds": 300,
       "Parameters": {
@@ -15,7 +15,7 @@
         "TaskDefinition": "TASK01_FAM",
         "NetworkConfiguration": {
           "AwsvpcConfiguration": {
-            "Subnets": ["SUBNET_IDS"],
+            "Subnets": SUBNET_JSON_ARRAY,
             "SecurityGroups": ["SG_ID"],
             "AssignPublicIp": "ENABLED"
           }
@@ -47,8 +47,8 @@
 
     "IngestDailyIndex": {
       "Type": "Task",
-      "Comment": "Script 02: fetch EDGAR daily master.idx → write changed CIKs. FULL_REFRESH=true bypasses the index and writes all NYSE/Nasdaq CIKs.",
-      "Resource": "arn:aws:states:::ecs:runTask.sync:2",
+      "Comment": "Script 02: fetch EDGAR daily master.idx -> write changed CIKs. FULL_REFRESH=true bypasses the index and writes all NYSE/Nasdaq CIKs.",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
       "TimeoutSeconds": 900,
       "HeartbeatSeconds": 300,
       "Parameters": {
@@ -57,7 +57,7 @@
         "TaskDefinition": "TASK02_FAM",
         "NetworkConfiguration": {
           "AwsvpcConfiguration": {
-            "Subnets": ["SUBNET_IDS"],
+            "Subnets": SUBNET_JSON_ARRAY,
             "SecurityGroups": ["SG_ID"],
             "AssignPublicIp": "ENABLED"
           }
@@ -91,7 +91,7 @@
     "IngestSubmissions": {
       "Type": "Task",
       "Comment": "Script 03: fetch submissions for changed CIKs (incremental: ~200-600 CIKs; full-refresh: ~5k, ~90 min)",
-      "Resource": "arn:aws:states:::ecs:runTask.sync:2",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
       "TimeoutSeconds": 5400,
       "HeartbeatSeconds": 300,
       "Parameters": {
@@ -100,7 +100,7 @@
         "TaskDefinition": "TASK03_FAM",
         "NetworkConfiguration": {
           "AwsvpcConfiguration": {
-            "Subnets": ["SUBNET_IDS"],
+            "Subnets": SUBNET_JSON_ARRAY,
             "SecurityGroups": ["SG_ID"],
             "AssignPublicIp": "ENABLED"
           }
@@ -134,7 +134,7 @@
     "IngestCompanyFacts": {
       "Type": "Task",
       "Comment": "Script 04: fetch XBRL facts for changed CIKs (incremental: ~200-600 CIKs; full-refresh: ~5k, ~90 min)",
-      "Resource": "arn:aws:states:::ecs:runTask.sync:2",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
       "TimeoutSeconds": 5400,
       "HeartbeatSeconds": 300,
       "Parameters": {
@@ -143,7 +143,7 @@
         "TaskDefinition": "TASK04_FAM",
         "NetworkConfiguration": {
           "AwsvpcConfiguration": {
-            "Subnets": ["SUBNET_IDS"],
+            "Subnets": SUBNET_JSON_ARRAY,
             "SecurityGroups": ["SG_ID"],
             "AssignPublicIp": "ENABLED"
           }

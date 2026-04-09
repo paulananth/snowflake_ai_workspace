@@ -12,7 +12,10 @@ param(
     [string]$ResourceGroup = $(if ($env:AZURE_RESOURCE_GROUP) { $env:AZURE_RESOURCE_GROUP } else { "my-sec-edgar-rg" }),
     [string]$ManagedIdentity = $(if ($env:AZURE_MANAGED_IDENTITY_NAME) { $env:AZURE_MANAGED_IDENTITY_NAME } else { "sec-edgar-ingest-identity" }),
     [string]$PipelineName = $(if ($env:ADF_PIPELINE_NAME) { $env:ADF_PIPELINE_NAME } else { "sec-edgar-bronze-ingest" }),
-    [string]$TriggerName = $(if ($env:ADF_TRIGGER_NAME) { $env:ADF_TRIGGER_NAME } else { "DailyBronzeIngestTrigger" })
+    [string]$TriggerName = $(if ($env:ADF_TRIGGER_NAME) { $env:ADF_TRIGGER_NAME } else { "DailyBronzeIngestTrigger" }),
+    [string]$MonthlyTriggerName = $(if ($env:ADF_MONTHLY_TRIGGER_NAME) { $env:ADF_MONTHLY_TRIGGER_NAME } else { "MonthlyBronzeFullRefreshTrigger" }),
+    [string]$FunctionAppName = $(if ($env:AZURE_FUNCTION_APP_NAME) { $env:AZURE_FUNCTION_APP_NAME } else { "" }),
+    [string]$FunctionLinkedServiceName = $(if ($env:ADF_FUNCTION_LINKED_SERVICE_NAME) { $env:ADF_FUNCTION_LINKED_SERVICE_NAME } else { "AzureFunctionBronzeLS" })
 )
 
 Set-StrictMode -Version Latest
@@ -98,6 +101,13 @@ function Test-ReferenceName($Reference, [string]$ExpectedName) {
     return ($null -ne $Reference -and [string]$Reference.referenceName -eq $ExpectedName)
 }
 
+function Get-LsProperties($LinkedService) {
+    if ($LinkedService.PSObject.Properties.Name -contains "properties") {
+        return $LinkedService.properties
+    }
+    return $LinkedService
+}
+
 Write-Hdr "0. Login"
 $account = Get-AzJsonOrNull @("account", "show", "--output", "json")
 if ($null -eq $account) {
@@ -105,7 +115,12 @@ if ($null -eq $account) {
     exit 1
 }
 $subscription = [string]$account.id
+$suffix = $subscription.Replace("-", "").Substring(0, 8).ToLowerInvariant()
+if ([string]::IsNullOrWhiteSpace($FunctionAppName)) {
+    $FunctionAppName = "sec-edgar-flex-$suffix"
+}
 Write-Pass "Logged in - subscription: $($account.name) ($subscription)"
+Write-Pass "Derived Function App name: $FunctionAppName"
 
 Write-Hdr "1. Resource Group"
 $rg = Get-AzJsonOrNull @("group", "show", "--name", $ResourceGroup, "--output", "json")
@@ -177,7 +192,27 @@ if ($null -eq $batch) {
     }
 }
 
-Write-Hdr "4. Data Factory"
+Write-Hdr "4. Function App"
+$functionApp = Get-AzJsonOrNull @("functionapp", "show", "--name", $FunctionAppName, "--resource-group", $ResourceGroup, "--output", "json")
+if ($null -eq $functionApp) {
+    Write-Fail "Function App '$FunctionAppName' not found"
+} else {
+    Write-Pass "Function App '$FunctionAppName' exists"
+    if ([string]$functionApp.kind -match "functionapp") { Write-Pass "Function App kind is '$($functionApp.kind)'" } else { Write-Warn "Unexpected Function App kind '$($functionApp.kind)'" }
+    if ($null -ne $functionApp.identity -and -not [string]::IsNullOrWhiteSpace([string]$functionApp.identity.principalId)) { Write-Pass "Function App has a managed identity" } else { Write-Fail "Function App is missing a managed identity" }
+
+    $functions = Get-AzJsonOrNull @("functionapp", "function", "list", "--name", $FunctionAppName, "--resource-group", $ResourceGroup, "--output", "json")
+    if ($null -eq $functions) {
+        Write-Fail "Could not list functions for '$FunctionAppName'"
+    } else {
+        $hasTickers = @($functions | Where-Object { [string]$_.name -like "*ingest_tickers_exchange" }).Count -gt 0
+        $hasDailyIndex = @($functions | Where-Object { [string]$_.name -like "*ingest_daily_index" }).Count -gt 0
+        if ($hasTickers) { Write-Pass "Function 'ingest_tickers_exchange' is indexed" } else { Write-Fail "Function 'ingest_tickers_exchange' is missing" }
+        if ($hasDailyIndex) { Write-Pass "Function 'ingest_daily_index' is indexed" } else { Write-Fail "Function 'ingest_daily_index' is missing" }
+    }
+}
+
+Write-Hdr "5. Data Factory"
 $adf = Get-AzJsonOrNull @("datafactory", "show", "--factory-name", $AdfName, "--resource-group", $ResourceGroup, "--output", "json")
 if ($null -eq $adf) {
     Write-Fail "ADF '$AdfName' not found"
@@ -189,7 +224,7 @@ if ($null -eq $adf) {
     if ($null -eq $storageLs) {
         Write-Fail "Linked service 'AzureStorageLS' not found"
     } else {
-        $storageLsProperties = if ($storageLs.PSObject.Properties.Name -contains "properties") { $storageLs.properties } else { $storageLs }
+        $storageLsProperties = Get-LsProperties $storageLs
         if ([string]$storageLsProperties.type -eq "AzureBlobStorage") { Write-Pass "AzureStorageLS type is AzureBlobStorage" } else { Write-Fail "AzureStorageLS type is '$($storageLsProperties.type)'" }
         if ($storageLsProperties.PSObject.Properties.Name -contains "connectionString") { Write-Pass "AzureStorageLS uses connectionString auth" } else { Write-Fail "AzureStorageLS is missing connectionString auth" }
     }
@@ -198,11 +233,21 @@ if ($null -eq $adf) {
     if ($null -eq $batchLs) {
         Write-Fail "Linked service 'AzureBatchLS' not found"
     } else {
-        $batchLsProperties = if ($batchLs.PSObject.Properties.Name -contains "properties") { $batchLs.properties } else { $batchLs }
+        $batchLsProperties = Get-LsProperties $batchLs
         if ([string]$batchLsProperties.type -eq "AzureBatch") { Write-Pass "AzureBatchLS type is AzureBatch" } else { Write-Fail "AzureBatchLS type is '$($batchLsProperties.type)'" }
         if ($batchLsProperties.PSObject.Properties.Name -contains "accessKey") { Write-Pass "AzureBatchLS uses accessKey auth" } else { Write-Fail "AzureBatchLS is missing accessKey auth" }
         if ([string]$batchLsProperties.accountName -eq $BatchAccount) { Write-Pass "AzureBatchLS accountName matches '$BatchAccount'" } else { Write-Warn "AzureBatchLS accountName is '$($batchLsProperties.accountName)'" }
         if ([string]$batchLsProperties.poolName -eq $BatchPoolId) { Write-Pass "AzureBatchLS poolName matches '$BatchPoolId'" } else { Write-Warn "AzureBatchLS poolName is '$($batchLsProperties.poolName)'" }
+    }
+
+    $functionLs = Get-AzJsonOrNull @("datafactory", "linked-service", "show", "--factory-name", $AdfName, "--resource-group", $ResourceGroup, "--linked-service-name", $FunctionLinkedServiceName, "--output", "json")
+    if ($null -eq $functionLs) {
+        Write-Fail "Linked service '$FunctionLinkedServiceName' not found"
+    } else {
+        $functionLsProperties = Get-LsProperties $functionLs
+        if ([string]$functionLsProperties.type -eq "AzureFunction") { Write-Pass "$FunctionLinkedServiceName type is AzureFunction" } else { Write-Fail "$FunctionLinkedServiceName type is '$($functionLsProperties.type)'" }
+        if ($functionLsProperties.PSObject.Properties.Name -contains "functionAppUrl") { Write-Pass "$FunctionLinkedServiceName has functionAppUrl" } else { Write-Fail "$FunctionLinkedServiceName is missing functionAppUrl" }
+        if ($functionLsProperties.PSObject.Properties.Name -contains "functionKey") { Write-Pass "$FunctionLinkedServiceName has functionKey auth" } else { Write-Fail "$FunctionLinkedServiceName is missing functionKey auth" }
     }
 
     $pipeline = Get-AzJsonOrNull @("datafactory", "pipeline", "show", "--factory-name", $AdfName, "--resource-group", $ResourceGroup, "--name", $PipelineName, "--output", "json")
@@ -211,16 +256,39 @@ if ($null -eq $adf) {
     } else {
         Write-Pass "Pipeline '$PipelineName' exists"
         $pipelineProperties = if ($pipeline.PSObject.Properties.Name -contains "properties") { $pipeline.properties } else { $pipeline }
-        foreach ($activityName in @("IngestTickersExchange", "IngestSubmissions", "IngestCompanyFacts")) {
+        if ($pipelineProperties.parameters.PSObject.Properties.Name -contains "ingestDate") { Write-Pass "Pipeline parameter 'ingestDate' exists" } else { Write-Fail "Pipeline parameter 'ingestDate' is missing" }
+        if ($pipelineProperties.parameters.PSObject.Properties.Name -contains "fullRefresh") { Write-Pass "Pipeline parameter 'fullRefresh' exists" } else { Write-Fail "Pipeline parameter 'fullRefresh' is missing" }
+
+        $tickers = $pipelineProperties.activities | Where-Object { $_.name -eq "IngestTickersExchange" } | Select-Object -First 1
+        if ($null -eq $tickers) {
+            Write-Fail "Pipeline activity 'IngestTickersExchange' is missing"
+        } else {
+            if ([string]$tickers.type -eq "AzureFunctionActivity") { Write-Pass "IngestTickersExchange uses AzureFunctionActivity" } else { Write-Fail "IngestTickersExchange type is '$($tickers.type)'" }
+            if (Test-ReferenceName $tickers.linkedServiceName $FunctionLinkedServiceName) { Write-Pass "IngestTickersExchange uses $FunctionLinkedServiceName" } else { Write-Fail "IngestTickersExchange does not reference $FunctionLinkedServiceName" }
+            if ([string]$tickers.typeProperties.functionName -eq "ingest_tickers_exchange") { Write-Pass "IngestTickersExchange functionName is ingest_tickers_exchange" } else { Write-Fail "IngestTickersExchange functionName is '$($tickers.typeProperties.functionName)'" }
+        }
+
+        $dailyIndex = $pipelineProperties.activities | Where-Object { $_.name -eq "IngestDailyIndex" } | Select-Object -First 1
+        if ($null -eq $dailyIndex) {
+            Write-Fail "Pipeline activity 'IngestDailyIndex' is missing"
+        } else {
+            if ([string]$dailyIndex.type -eq "AzureFunctionActivity") { Write-Pass "IngestDailyIndex uses AzureFunctionActivity" } else { Write-Fail "IngestDailyIndex type is '$($dailyIndex.type)'" }
+            if (Test-ReferenceName $dailyIndex.linkedServiceName $FunctionLinkedServiceName) { Write-Pass "IngestDailyIndex uses $FunctionLinkedServiceName" } else { Write-Fail "IngestDailyIndex does not reference $FunctionLinkedServiceName" }
+            if ([string]$dailyIndex.typeProperties.functionName -eq "ingest_daily_index") { Write-Pass "IngestDailyIndex functionName is ingest_daily_index" } else { Write-Fail "IngestDailyIndex functionName is '$($dailyIndex.typeProperties.functionName)'" }
+        }
+
+        foreach ($activityName in @("IngestSubmissions", "IngestCompanyFacts")) {
             $activity = $pipelineProperties.activities | Where-Object { $_.name -eq $activityName } | Select-Object -First 1
             if ($null -eq $activity) {
                 Write-Fail "Pipeline activity '$activityName' is missing"
                 continue
             }
             $activityProperties = if ($activity.PSObject.Properties.Name -contains "typeProperties") { $activity.typeProperties } else { $activity }
+            if ([string]$activity.type -eq "Custom") { Write-Pass "$activityName uses Custom activity" } else { Write-Fail "$activityName type is '$($activity.type)'" }
             if (Test-ReferenceName $activity.linkedServiceName "AzureBatchLS") { Write-Pass "$activityName uses AzureBatchLS" } else { Write-Fail "$activityName does not reference AzureBatchLS" }
             if (Test-ReferenceName $activityProperties.resourceLinkedService "AzureStorageLS") { Write-Pass "$activityName stages resources from AzureStorageLS" } else { Write-Fail "$activityName is missing AzureStorageLS staging" }
             if ([string]$activityProperties.folderPath -eq "$Container/adf-resources") { Write-Pass "$activityName folderPath is '$Container/adf-resources'" } else { Write-Fail "$activityName folderPath is '$($activityProperties.folderPath)'" }
+            if ([string]$activityProperties.command.value -match "FULL_REFRESH") { Write-Pass "$activityName command carries fullRefresh into Batch" } else { Write-Fail "$activityName command does not carry fullRefresh into Batch" }
         }
     }
 
@@ -230,17 +298,29 @@ if ($null -eq $adf) {
     } else {
         Write-Pass "Trigger '$TriggerName' exists"
         if ([string]$trigger.properties.runtimeState -eq "Started") { Write-Pass "Trigger '$TriggerName' is started" } else { Write-Warn "Trigger '$TriggerName' runtimeState is '$($trigger.properties.runtimeState)'" }
-        if ([string]$trigger.properties.pipeline.pipelineReference.referenceName -eq $PipelineName) { Write-Pass "Trigger targets pipeline '$PipelineName'" } else { Write-Fail "Trigger points to '$($trigger.properties.pipeline.pipelineReference.referenceName)'" }
+        if ([string]$trigger.properties.pipeline.pipelineReference.referenceName -eq $PipelineName) { Write-Pass "Daily trigger targets pipeline '$PipelineName'" } else { Write-Fail "Daily trigger points to '$($trigger.properties.pipeline.pipelineReference.referenceName)'" }
+        if ($trigger.properties.pipeline.parameters.fullRefresh -eq $false) { Write-Pass "Daily trigger sets fullRefresh=false" } else { Write-Fail "Daily trigger fullRefresh is not false" }
+    }
+
+    $monthlyTrigger = Get-AzJsonOrNull @("datafactory", "trigger", "show", "--factory-name", $AdfName, "--resource-group", $ResourceGroup, "--name", $MonthlyTriggerName, "--output", "json")
+    if ($null -eq $monthlyTrigger) {
+        Write-Fail "Trigger '$MonthlyTriggerName' not found"
+    } else {
+        Write-Pass "Trigger '$MonthlyTriggerName' exists"
+        if ([string]$monthlyTrigger.properties.runtimeState -eq "Started") { Write-Pass "Trigger '$MonthlyTriggerName' is started" } else { Write-Warn "Trigger '$MonthlyTriggerName' runtimeState is '$($monthlyTrigger.properties.runtimeState)'" }
+        if ([string]$monthlyTrigger.properties.pipelines[0].pipelineReference.referenceName -eq $PipelineName) { Write-Pass "Monthly trigger targets pipeline '$PipelineName'" } else { Write-Fail "Monthly trigger points to '$($monthlyTrigger.properties.pipelines[0].pipelineReference.referenceName)'" }
+        if ($monthlyTrigger.properties.pipelines[0].parameters.fullRefresh -eq $true) { Write-Pass "Monthly trigger sets fullRefresh=true" } else { Write-Fail "Monthly trigger fullRefresh is not true" }
     }
 }
 
-Write-Hdr "5. Managed Identity RBAC"
+Write-Hdr "6. Managed Identity RBAC"
 $identity = Get-AzJsonOrNull @("identity", "show", "--name", $ManagedIdentity, "--resource-group", $ResourceGroup, "--output", "json")
+$storageScope = "/subscriptions/$subscription/resourceGroups/$ResourceGroup/providers/Microsoft.Storage/storageAccounts/$StorageAccount"
+$batchScope = "/subscriptions/$subscription/resourceGroups/$ResourceGroup/providers/Microsoft.Batch/batchAccounts/$BatchAccount"
 if ($null -eq $identity) {
     Write-Fail "Managed identity '$ManagedIdentity' not found"
 } else {
     Write-Pass "Managed identity '$ManagedIdentity' found"
-    $storageScope = "/subscriptions/$subscription/resourceGroups/$ResourceGroup/providers/Microsoft.Storage/storageAccounts/$StorageAccount"
     $storageRbacEntries = Get-AzJsonOrNull @(
         "role", "assignment", "list",
         "--assignee-object-id", [string]$identity.principalId,
@@ -249,12 +329,43 @@ if ($null -eq $identity) {
         "--output", "json"
     )
     if (@($storageRbacEntries).Count -ge 1) {
-        Write-Pass "Storage Blob Data Contributor assigned on the storage account"
+        Write-Pass "Batch UAMI has Storage Blob Data Contributor on the storage account"
     } else {
-        Write-Fail "Storage Blob Data Contributor is missing on the storage account"
+        Write-Fail "Batch UAMI is missing Storage Blob Data Contributor on the storage account"
     }
-    Write-Warn "AcrPull is intentionally not required for the host-executed runtime"
 }
+
+if ($null -ne $functionApp -and $null -ne $functionApp.identity) {
+    $functionStorageRbacEntries = Get-AzJsonOrNull @(
+        "role", "assignment", "list",
+        "--assignee-object-id", [string]$functionApp.identity.principalId,
+        "--role", "Storage Blob Data Contributor",
+        "--scope", $storageScope,
+        "--output", "json"
+    )
+    if (@($functionStorageRbacEntries).Count -ge 1) {
+        Write-Pass "Function App MI has Storage Blob Data Contributor on the storage account"
+    } else {
+        Write-Fail "Function App MI is missing Storage Blob Data Contributor on the storage account"
+    }
+}
+
+if ($null -ne $adf -and $null -ne $adf.identity) {
+    $adfBatchRbacEntries = Get-AzJsonOrNull @(
+        "role", "assignment", "list",
+        "--assignee-object-id", [string]$adf.identity.principalId,
+        "--role", "Contributor",
+        "--scope", $batchScope,
+        "--output", "json"
+    )
+    if (@($adfBatchRbacEntries).Count -ge 1) {
+        Write-Pass "ADF system MI has Contributor on the Batch account"
+    } else {
+        Write-Fail "ADF system MI is missing Contributor on the Batch account"
+    }
+}
+
+Write-Warn "AcrPull is intentionally not required for the host-executed runtime"
 
 Write-Host ""
 Write-Host "======================================" -ForegroundColor Cyan

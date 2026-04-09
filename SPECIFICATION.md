@@ -146,7 +146,8 @@ INGEST_WORKERS   = 8      # parallel HTTP threads within a single task
 # Each task uses ≤8 req/s; sequential execution keeps combined rate under SEC's 10 req/s limit.
 INGEST_RATE_RPS  = 8.0    # max req/s per task
 BATCH_SIZE       = 500    # CIKs per Parquet batch file
-TARGET_EXCHANGES = ["NYSE", "Nasdaq"]
+# Azure CDC now uses the full ticker snapshot universe across all exchanges.
+TARGET_EXCHANGES = []  # legacy allowlist for older bulk scripts only
 
 # ─── Ingest date (injectable for backfill) ─────────────────────────────────────
 INGEST_DATE = os.environ.get("INGEST_DATE", date.today().isoformat())
@@ -1853,9 +1854,10 @@ Use this path for lightweight Azure-hosted stages that fit Function limits. This
 
 **Repo implementation**:
 - Function app project: `function_apps/adf_tickers_ingest/`
-- ADF linked service template: `workflows/adf_linked_services_function_tickers.json`
-- ADF pipeline template: `workflows/adf_pipeline_function_tickers.json`
-- Azure CLI deploy script: `deploy/deploy_function_tickers.ps1`
+- ADF linked service template: `workflows/adf_linked_services.json`
+- ADF pipeline template: `workflows/adf_pipeline.json`
+- ADF trigger templates: `workflows/adf_trigger.json`, `workflows/adf_trigger_monthly.json`
+- Azure CLI deploy script: `deploy/deploy.ps1`
 
 **Build and deploy flow**:
 1. Package `function_apps/adf_tickers_ingest/` together with `config/` and `scripts/ingest/`.
@@ -1868,8 +1870,10 @@ Use this path for lightweight Azure-hosted stages that fit Function limits. This
    - `AZURE_STORAGE_ACCOUNT`
    - `AZURE_CONTAINER`
    - `STORAGE_PREFIX`
-5. Create or update the ADF `AzureFunction` linked service using the Function host URL and function key.
-6. Run the ADF pipeline with `ingestDate` in the request body.
+5. Upload the Batch task bundle to `sec-edgar/adf-resources/sec-edgar-task.zip`.
+6. Create or update the ADF `AzureFunction` and `AzureBatch` linked services.
+7. Create or update the 4-stage ADF pipeline with parameters `ingestDate` and `fullRefresh`.
+8. Create or update a daily CDC trigger and a monthly full-refresh trigger.
 
 **Function host note**: for Flex Consumption, resolve the host URL from `properties.defaultHostName`:
 
@@ -1881,28 +1885,19 @@ az functionapp show \
   --output tsv
 ```
 
-**ADF pipeline** (`workflows/adf_pipeline_function_tickers.json`): a single `AzureFunctionActivity` that POSTs the ingest date to the Function App.
+**ADF pipeline** (`workflows/adf_pipeline.json`): a 4-stage Bronze CDC flow.
 
 ```json
 {
-  "name": "InvokeTickersExchangeFunction",
-  "type": "AzureFunctionActivity",
-  "linkedServiceName": {
-    "referenceName": "AzureFunctionTickersLS",
-    "type": "LinkedServiceReference"
-  },
-  "policy": {
-    "timeout": "0.00:15:00",
-    "retry": 2,
-    "retryIntervalInSeconds": 120
-  },
-  "typeProperties": {
-    "functionName": "ingest_tickers_exchange",
-    "method": "POST",
-    "body": {
-      "type": "Expression",
-      "value": "@concat('{\"ingestDate\":\"', pipeline().parameters.ingestDate, '\"}')"
-    }
+  "activities": [
+    {"name": "IngestTickersExchange", "type": "AzureFunctionActivity"},
+    {"name": "IngestDailyIndex", "type": "AzureFunctionActivity"},
+    {"name": "IngestSubmissions", "type": "Custom"},
+    {"name": "IngestCompanyFacts", "type": "Custom"}
+  ],
+  "parameters": {
+    "ingestDate": {"type": "string"},
+    "fullRefresh": {"type": "Bool"}
   }
 }
 ```
@@ -1910,12 +1905,13 @@ az functionapp show \
 **Current limit**: `function_apps/adf_tickers_ingest/host.json` sets `functionTimeout` to `00:10:00`. If a stage will exceed that limit or requires materially more memory, move that stage to the Azure Batch fallback path instead of forcing it into Functions.
 
 **Validation path**:
-1. Directly invoke the Function App and confirm it returns `status = Succeeded`
+1. Directly invoke the Function App and confirm both Function endpoints return `status = Succeeded`
 2. Run the ADF pipeline and capture the `runId`
-3. Verify the output file exists at:
-   `abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/{PREFIX}/bronze/company_tickers_exchange/ingestion_date={YYYY-MM-DD}/data.parquet`
+3. Verify the daily-index output file exists at:
+   `abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/{PREFIX}/bronze/daily_index/ingestion_date={YYYY-MM-DD}/data.parquet`
+4. Verify the downstream submissions and companyfacts stages process only that changed CIK set unless `fullRefresh=true`
 
-**Triggering**: use `Trigger now` or a schedule / tumbling-window trigger in ADF. The repo currently ships the linked service and pipeline templates for the validated ticker path; create the trigger separately if you want scheduled execution.
+**Triggering**: the repo ships both the daily CDC trigger and the monthly full-refresh trigger.
 
 ### 12.3 Option B — AWS Step Functions + ECS Fargate
 
@@ -2045,7 +2041,7 @@ sec_edgar_platform/
 │   └── silver_to_gold/
 │       └── 01_build_gold.py                ← DuckDB in-memory: silver → gold/ (5 tables)
 ├── deploy/
-│   └── deploy_function_tickers.ps1         ← Azure CLI deploy for Function App + ADF ticker pipeline
+│   └── deploy.ps1                           ← Azure CLI deploy for the mixed Bronze CDC pipeline
 ├── workflows/
 │   ├── adf_pipeline_function_tickers.json  ← Azure: ADF Azure Function pipeline (validated ticker path)
 │   ├── adf_linked_services_function_tickers.json ← Azure: Azure Function linked service template
@@ -2188,19 +2184,19 @@ aws stepfunctions start-execution \
   --state-machine-arn arn:aws:states:{region}:{account}:stateMachine:sec-edgar-daily \
   --input '{"ingestDate": "2024-01-25", "subnets": ["subnet-xxx"], "securityGroups": ["sg-xxx"]}'
 
-# Azure (trigger the validated ADF + Function ticker pipeline manually)
+# Azure (trigger the validated mixed ADF Bronze CDC pipeline manually)
 cat >/tmp/adf-run.json <<'JSON'
-{"ingestDate":"2024-01-25"}
+{"ingestDate":"2024-01-25","fullRefresh":false}
 JSON
 
 az datafactory pipeline create-run \
   --factory-name my-adf \
   --resource-group my-rg \
-  --name sec-edgar-function-tickers-ingest \
+  --name sec-edgar-bronze-ingest \
   --parameters @/tmp/adf-run.json
 
-# Expected result: Function activity succeeds and writes:
-# abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/{PREFIX}/bronze/company_tickers_exchange/ingestion_date=2024-01-25/data.parquet
+# Expected result: the pipeline succeeds and writes:
+# abfss://{CONTAINER}@{ACCOUNT}.dfs.core.windows.net/{PREFIX}/bronze/daily_index/ingestion_date=2024-01-25/data.parquet
 ```
 
 ### Step 8 — Idempotency check (Path A)
@@ -2380,7 +2376,7 @@ Start with `financial_statements_annual` (highest value). Each gold table is a s
 
 ### Phase A-5 — Wire Up Cloud Orchestration
 
-**Azure:** Create `function_apps/adf_tickers_ingest/`, `workflows/adf_linked_services_function_tickers.json`, and `workflows/adf_pipeline_function_tickers.json`. Deploy with `deploy/deploy_function_tickers.ps1` (Azure CLI). Use the Azure Batch fallback assets only for stages that exceed Function limits.
+**Azure:** Create `function_apps/adf_tickers_ingest/`, `workflows/adf_linked_services.json`, `workflows/adf_pipeline.json`, `workflows/adf_trigger.json`, and `workflows/adf_trigger_monthly.json`. Deploy with `deploy/deploy.ps1` (Azure CLI). Use Azure Functions for ticker snapshot and daily-index CDC, and Azure Batch for submissions and companyfacts.
 
 **AWS:** Create `workflows/step_functions_definition.json` + `workflows/ecs_task_definition.json` (Section 13, Option B — Step Functions). Deploy via `aws cloudformation` or Terraform.
 

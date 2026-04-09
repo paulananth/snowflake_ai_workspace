@@ -1,0 +1,41 @@
+{
+  "_comment": [
+    "Monthly schedule trigger for reconciliation runs.",
+    "Runs on day 1 of each month at 06:00 UTC.",
+    "Passes the trigger time as ingestDate and sets fullRefresh=true."
+  ],
+  "name": "MonthlyBronzeFullRefreshTrigger",
+  "properties": {
+    "description": "Monthly SEC EDGAR Bronze reconciliation at 06:00 UTC on day 1. Passes fullRefresh=true.",
+    "type": "ScheduleTrigger",
+    "typeProperties": {
+      "recurrence": {
+        "frequency": "Month",
+        "interval": 1,
+        "startTime": "2026-05-01T06:00:00Z",
+        "timeZone": "UTC",
+        "schedule": {
+          "monthDays": [1],
+          "hours": [6],
+          "minutes": [0]
+        }
+      }
+    },
+    "pipelines": [
+      {
+        "pipelineReference": {
+          "referenceName": "sec-edgar-bronze-ingest",
+          "type": "PipelineReference"
+        },
+        "parameters": {
+          "ingestDate": {
+            "type": "Expression",
+            "value": "@formatDateTime(trigger().scheduledTime, 'yyyy-MM-dd')"
+          },
+          "fullRefresh": true
+        }
+      }
+    ],
+    "annotations": ["sec-edgar", "monthly", "bronze", "full-refresh"]
+  }
+}
