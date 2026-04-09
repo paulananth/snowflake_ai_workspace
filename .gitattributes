@@ -1,0 +1,9 @@
+# Ensure shell scripts always use LF line endings (never CRLF)
+# regardless of the OS where git checkout runs.
+*.sh    text eol=lf
+*.py    text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.toml  text eol=lf
+*.lock  text eol=lf
