@@ -1,0 +1,27 @@
+{
+  "_comment": "ECS task role for the ingest scripts. Scoped to the pipeline's S3 prefix only. No DeleteObject — tasks only write and read. Placeholders: BUCKET, REGION are substituted by deploy_aws.sh.",
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "S3WriteRead",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject"],
+      "Resource": "arn:aws:s3:::BUCKET/sec-edgar/bronze/*"
+    },
+    {
+      "Sid": "S3List",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::BUCKET",
+      "Condition": {
+        "StringLike": {"s3:prefix": ["sec-edgar/bronze/*"]}
+      }
+    },
+    {
+      "Sid": "S3BucketLocation",
+      "Effect": "Allow",
+      "Action": "s3:GetBucketLocation",
+      "Resource": "arn:aws:s3:::BUCKET"
+    }
+  ]
+}

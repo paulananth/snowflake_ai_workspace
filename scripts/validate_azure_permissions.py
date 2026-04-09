@@ -4,20 +4,28 @@ Pre-flight permission validator for the SEC EDGAR Bronze ingest pipeline.
 Checks every permission the pipeline needs before committing to a full run.
 Exits 0 if all checks pass. Exits 1 with a failure summary if any check fails.
 
-ADF runs this as the first activity (ValidatePermissions) before the ingest
-activities, so a misconfigured identity fails fast with a clear error message
-rather than hours into a run.
+On Azure, ADF runs this as the first activity (ValidatePermissions) before the
+ingest activities. On AWS, deploy_aws.sh runs it after docker push.
 
 Usage:
-  # Local (uses az login):
+  # Local (filesystem only):
   python scripts/validate_azure_permissions.py --cloud local
 
   # Azure (uses Managed Identity on Batch node):
   python scripts/validate_azure_permissions.py --cloud azure
 
+  # AWS (uses boto3 credential chain — env vars, ~/.aws/credentials, or ECS task role):
+  python scripts/validate_azure_permissions.py --cloud aws
+
 Environment (for --cloud azure):
   AZURE_STORAGE_ACCOUNT   required
   AZURE_CONTAINER         optional (default: sec-edgar)
+
+Environment (for --cloud aws):
+  AWS_BUCKET              required
+  AWS_DEFAULT_REGION      required (or set in ~/.aws/config)
+
+Common:
   SEC_USER_AGENT          required (for EDGAR reachability check)
 """
 import argparse
@@ -123,9 +131,17 @@ def check_edgar_reachability() -> tuple[bool, str]:
 
 
 def check_credential_identity(cloud: str) -> tuple[bool, str]:
-    """Verify Azure credential resolves — AzureCliCredential locally, DefaultAzureCredential on Batch."""
+    """Verify the active credential resolves and print the identity."""
     if cloud == "local" and not settings.AZURE_ACCOUNT:
-        return True, "no Azure account configured — skipped"
+        return True, "no cloud account configured — skipped"
+
+    if cloud == "aws":
+        try:
+            import boto3
+            identity = boto3.client("sts").get_caller_identity()
+            return True, f"STS identity OK — ARN: {identity['Arn']}"
+        except Exception as exc:
+            return False, f"AWS credential failed: {exc}"
 
     try:
         if cloud == "local":
@@ -143,12 +159,43 @@ def check_credential_identity(cloud: str) -> tuple[bool, str]:
         return False, f"Credential failed: {exc}"
 
 
+def check_s3_write(cloud: str) -> tuple[bool, str]:
+    """Write a small test object to S3, then delete it."""
+    if cloud != "aws":
+        return True, "not AWS — skipped"
+    try:
+        import s3fs
+        fs = s3fs.S3FileSystem()
+        bucket = settings.AWS_BUCKET
+        test_key = f"{bucket}/sec-edgar/bronze/.permission_check"
+        with fs.open(test_key, "wb") as f:
+            f.write(b"ok")
+        fs.rm(test_key)
+        return True, f"S3 write/delete OK (s3://{bucket}/sec-edgar/bronze/)"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def check_s3_read(cloud: str) -> tuple[bool, str]:
+    """List the bucket root to verify GetObject + ListBucket."""
+    if cloud != "aws":
+        return True, "not AWS — skipped"
+    try:
+        import s3fs
+        fs = s3fs.S3FileSystem()
+        bucket = settings.AWS_BUCKET
+        fs.ls(f"{bucket}/")
+        return True, f"S3 list OK (s3://{bucket}/)"
+    except Exception as exc:
+        return False, str(exc)
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 CHECKS = [
     ("Credential / identity",    lambda cloud: check_credential_identity(cloud)),
-    ("ADLS read (list)",         lambda cloud: check_adls_read(cloud)),
-    ("ADLS write + delete",      lambda cloud: check_adls_write(cloud)),
+    ("Storage read (list)",      lambda cloud: check_s3_read(cloud) if cloud == "aws" else check_adls_read(cloud)),
+    ("Storage write + delete",   lambda cloud: check_s3_write(cloud) if cloud == "aws" else check_adls_write(cloud)),
     ("SEC EDGAR reachability",   lambda cloud: check_edgar_reachability()),
 ]
 
@@ -157,7 +204,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--cloud",
-        choices=["local", "azure"],
+        choices=["local", "azure", "aws"],
         default=os.environ.get("CLOUD_PROVIDER", "local"),
         help="Cloud provider to validate (default: CLOUD_PROVIDER env or 'local')",
     )
@@ -170,6 +217,9 @@ def main() -> None:
     if cloud == "azure":
         print(f"  Storage account: {settings.AZURE_ACCOUNT or '(not set)'}")
         print(f"  Container:       {settings.AZURE_CONTAINER}")
+    elif cloud == "aws":
+        print(f"  S3 bucket:       {settings.AWS_BUCKET or '(not set)'}")
+        print(f"  Region:          {settings.AWS_DEFAULT_REGION or '(not set)'}")
     print(f"{'=' * 60}")
 
     results: list[tuple[str, bool, str]] = []
