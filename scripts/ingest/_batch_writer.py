@@ -1,10 +1,12 @@
 """
-Write (and read) PyArrow tables as Parquet — local filesystem or Azure Blob Storage.
+Write (and read) PyArrow tables as Parquet — local filesystem, Azure Blob Storage, or AWS S3.
 
 Cloud provider is determined by config.settings.CLOUD_PROVIDER at call time.
-Azure auth uses DefaultAzureCredential:
-  - Local dev:  az login (picks up your interactive session)
-  - Azure Batch: Managed Identity assigned to the pool (no secrets in code)
+
+Auth:
+  local  — plain filesystem, no credentials
+  azure  — DefaultAzureCredential (az login locally; Managed Identity on Batch)
+  aws    — boto3 credential chain (env vars → ~/.aws/credentials → ECS task role)
 """
 import io
 import pathlib
@@ -41,6 +43,7 @@ def write_parquet(table: pa.Table, path: str) -> None:
     path format:
       local: "output/bronze/submissions_meta/..."
       azure: "abfss://sec-edgar@account.dfs.core.windows.net/sec-edgar/bronze/..."
+      aws:   "s3://bucket/sec-edgar/bronze/..."
     """
     if settings.CLOUD_PROVIDER == "local":
         local = pathlib.Path(path)
@@ -63,14 +66,24 @@ def write_parquet(table: pa.Table, path: str) -> None:
             f.write(buf.getvalue())
         return
 
+    if settings.CLOUD_PROVIDER == "aws":
+        import s3fs
+        fs = s3fs.S3FileSystem()  # boto3 chain: env → profile → ECS task role
+        buf = io.BytesIO()
+        pq.write_table(table, buf, compression="snappy")
+        buf.seek(0)
+        with fs.open(path, "wb") as f:
+            f.write(buf.getvalue())
+        return
+
     raise ValueError(f"Unknown CLOUD_PROVIDER: {settings.CLOUD_PROVIDER!r}")
 
 
 def read_parquet(path: str) -> pa.Table:
     """
-    Read a Parquet file from local or Azure Blob Storage.
+    Read a Parquet file from local, Azure Blob Storage, or AWS S3.
 
-    Used by scripts 02 and 03 to load the tickers table produced by script 01.
+    Used by downstream scripts to load tables produced by the preceding script.
     """
     if settings.CLOUD_PROVIDER == "local":
         return pq.read_table(path)
@@ -84,5 +97,41 @@ def read_parquet(path: str) -> pa.Table:
         )
         blob_path = _abfss_to_blob_path(path)
         return pq.read_table(blob_path, filesystem=fs)
+
+    if settings.CLOUD_PROVIDER == "aws":
+        import s3fs
+        fs = s3fs.S3FileSystem()
+        return pq.read_table(path, filesystem=fs)
+
+    raise ValueError(f"Unknown CLOUD_PROVIDER: {settings.CLOUD_PROVIDER!r}")
+
+
+def parquet_exists(path: str) -> bool:
+    """
+    Return True if the Parquet file at path already exists.
+
+    Used for idempotency checks and skip-existing-batches resume logic.
+    """
+    if settings.CLOUD_PROVIDER == "local":
+        return pathlib.Path(path).exists()
+
+    if settings.CLOUD_PROVIDER == "azure":
+        import adlfs
+        from azure.identity import DefaultAzureCredential
+        fs = adlfs.AzureBlobFileSystem(
+            account_name=settings.AZURE_ACCOUNT,
+            credential=DefaultAzureCredential(),
+        )
+        try:
+            return fs.exists(_abfss_to_blob_path(path))
+        except Exception:
+            return False
+
+    if settings.CLOUD_PROVIDER == "aws":
+        import s3fs
+        try:
+            return s3fs.S3FileSystem().exists(path)
+        except Exception:
+            return False
 
     raise ValueError(f"Unknown CLOUD_PROVIDER: {settings.CLOUD_PROVIDER!r}")

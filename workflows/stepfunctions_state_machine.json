@@ -1,0 +1,178 @@
+{
+  "Comment": "SEC EDGAR Bronze ingest — 4 sequential ECS Fargate tasks. Incremental by default (only CIKs that filed today); set fullRefresh:true for full scan of all ~5k NYSE/Nasdaq CIKs. Input: {\"ingestDate\": \"YYYY-MM-DD\", \"fullRefresh\": false}",
+  "StartAt": "IngestTickersExchange",
+  "States": {
+
+    "IngestTickersExchange": {
+      "Type": "Task",
+      "Comment": "Script 01: fetch company_tickers_exchange.json snapshot (1 HTTP call, ~10k rows)",
+      "Resource": "arn:aws:states:::ecs:runTask.sync:2",
+      "TimeoutSeconds": 900,
+      "HeartbeatSeconds": 300,
+      "Parameters": {
+        "LaunchType": "FARGATE",
+        "Cluster": "ECS_CLUSTER_ARN",
+        "TaskDefinition": "TASK01_FAM",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "Subnets": ["SUBNET_IDS"],
+            "SecurityGroups": ["SG_ID"],
+            "AssignPublicIp": "ENABLED"
+          }
+        },
+        "Overrides": {
+          "TaskRoleArn": "TASK_ROLE_ARN",
+          "ExecutionRoleArn": "EXEC_ROLE_ARN",
+          "ContainerOverrides": [{
+            "Name": "ingest",
+            "Command.$": "States.Array('python', 'scripts/ingest/01_ingest_tickers_exchange.py', '--date', $.ingestDate)",
+            "Environment": [
+              {"Name": "CLOUD_PROVIDER",     "Value": "aws"},
+              {"Name": "AWS_BUCKET",         "Value": "AWS_BUCKET_VALUE"},
+              {"Name": "AWS_DEFAULT_REGION", "Value": "AWS_REGION"},
+              {"Name": "SEC_USER_AGENT",     "Value": "SEC_USER_AGENT_VALUE"}
+            ]
+          }]
+        }
+      },
+      "Retry": [{
+        "ErrorEquals": ["States.TaskFailed", "States.HeartbeatTimeout"],
+        "IntervalSeconds": 300,
+        "MaxAttempts": 1,
+        "BackoffRate": 1.0
+      }],
+      "ResultPath": null,
+      "Next": "IngestDailyIndex"
+    },
+
+    "IngestDailyIndex": {
+      "Type": "Task",
+      "Comment": "Script 02: fetch EDGAR daily master.idx → write changed CIKs. FULL_REFRESH=true bypasses the index and writes all NYSE/Nasdaq CIKs.",
+      "Resource": "arn:aws:states:::ecs:runTask.sync:2",
+      "TimeoutSeconds": 900,
+      "HeartbeatSeconds": 300,
+      "Parameters": {
+        "LaunchType": "FARGATE",
+        "Cluster": "ECS_CLUSTER_ARN",
+        "TaskDefinition": "TASK02_FAM",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "Subnets": ["SUBNET_IDS"],
+            "SecurityGroups": ["SG_ID"],
+            "AssignPublicIp": "ENABLED"
+          }
+        },
+        "Overrides": {
+          "TaskRoleArn": "TASK_ROLE_ARN",
+          "ExecutionRoleArn": "EXEC_ROLE_ARN",
+          "ContainerOverrides": [{
+            "Name": "ingest",
+            "Command.$": "States.Array('python', 'scripts/ingest/02_ingest_daily_index.py', '--date', $.ingestDate)",
+            "Environment": [
+              {"Name": "CLOUD_PROVIDER",     "Value": "aws"},
+              {"Name": "AWS_BUCKET",         "Value": "AWS_BUCKET_VALUE"},
+              {"Name": "AWS_DEFAULT_REGION", "Value": "AWS_REGION"},
+              {"Name": "SEC_USER_AGENT",     "Value": "SEC_USER_AGENT_VALUE"},
+              {"Name": "FULL_REFRESH",       "Value.$": "States.Format('{}', $.fullRefresh)"}
+            ]
+          }]
+        }
+      },
+      "Retry": [{
+        "ErrorEquals": ["States.TaskFailed", "States.HeartbeatTimeout"],
+        "IntervalSeconds": 300,
+        "MaxAttempts": 1,
+        "BackoffRate": 1.0
+      }],
+      "ResultPath": null,
+      "Next": "IngestSubmissions"
+    },
+
+    "IngestSubmissions": {
+      "Type": "Task",
+      "Comment": "Script 03: fetch submissions for changed CIKs (incremental: ~200-600 CIKs; full-refresh: ~5k, ~90 min)",
+      "Resource": "arn:aws:states:::ecs:runTask.sync:2",
+      "TimeoutSeconds": 5400,
+      "HeartbeatSeconds": 300,
+      "Parameters": {
+        "LaunchType": "FARGATE",
+        "Cluster": "ECS_CLUSTER_ARN",
+        "TaskDefinition": "TASK03_FAM",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "Subnets": ["SUBNET_IDS"],
+            "SecurityGroups": ["SG_ID"],
+            "AssignPublicIp": "ENABLED"
+          }
+        },
+        "Overrides": {
+          "TaskRoleArn": "TASK_ROLE_ARN",
+          "ExecutionRoleArn": "EXEC_ROLE_ARN",
+          "ContainerOverrides": [{
+            "Name": "ingest",
+            "Command.$": "States.Array('python', 'scripts/ingest/03_ingest_submissions.py', '--date', $.ingestDate)",
+            "Environment": [
+              {"Name": "CLOUD_PROVIDER",     "Value": "aws"},
+              {"Name": "AWS_BUCKET",         "Value": "AWS_BUCKET_VALUE"},
+              {"Name": "AWS_DEFAULT_REGION", "Value": "AWS_REGION"},
+              {"Name": "SEC_USER_AGENT",     "Value": "SEC_USER_AGENT_VALUE"},
+              {"Name": "FULL_REFRESH",       "Value.$": "States.Format('{}', $.fullRefresh)"}
+            ]
+          }]
+        }
+      },
+      "Retry": [{
+        "ErrorEquals": ["States.TaskFailed", "States.HeartbeatTimeout"],
+        "IntervalSeconds": 300,
+        "MaxAttempts": 1,
+        "BackoffRate": 1.0
+      }],
+      "ResultPath": null,
+      "Next": "IngestCompanyFacts"
+    },
+
+    "IngestCompanyFacts": {
+      "Type": "Task",
+      "Comment": "Script 04: fetch XBRL facts for changed CIKs (incremental: ~200-600 CIKs; full-refresh: ~5k, ~90 min)",
+      "Resource": "arn:aws:states:::ecs:runTask.sync:2",
+      "TimeoutSeconds": 5400,
+      "HeartbeatSeconds": 300,
+      "Parameters": {
+        "LaunchType": "FARGATE",
+        "Cluster": "ECS_CLUSTER_ARN",
+        "TaskDefinition": "TASK04_FAM",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "Subnets": ["SUBNET_IDS"],
+            "SecurityGroups": ["SG_ID"],
+            "AssignPublicIp": "ENABLED"
+          }
+        },
+        "Overrides": {
+          "TaskRoleArn": "TASK_ROLE_ARN",
+          "ExecutionRoleArn": "EXEC_ROLE_ARN",
+          "ContainerOverrides": [{
+            "Name": "ingest",
+            "Command.$": "States.Array('python', 'scripts/ingest/04_ingest_companyfacts.py', '--date', $.ingestDate)",
+            "Environment": [
+              {"Name": "CLOUD_PROVIDER",     "Value": "aws"},
+              {"Name": "AWS_BUCKET",         "Value": "AWS_BUCKET_VALUE"},
+              {"Name": "AWS_DEFAULT_REGION", "Value": "AWS_REGION"},
+              {"Name": "SEC_USER_AGENT",     "Value": "SEC_USER_AGENT_VALUE"},
+              {"Name": "FULL_REFRESH",       "Value.$": "States.Format('{}', $.fullRefresh)"}
+            ]
+          }]
+        }
+      },
+      "Retry": [{
+        "ErrorEquals": ["States.TaskFailed", "States.HeartbeatTimeout"],
+        "IntervalSeconds": 300,
+        "MaxAttempts": 1,
+        "BackoffRate": 1.0
+      }],
+      "ResultPath": null,
+      "End": true
+    }
+
+  }
+}
