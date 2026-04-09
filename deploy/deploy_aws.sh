@@ -42,8 +42,8 @@ EXECUTION_ROLE_NAME="sec-edgar-ecs-execution-role"
 SF_ROLE_NAME="sec-edgar-stepfunctions-role"
 SCHEDULER_ROLE_NAME="sec-edgar-scheduler-role"
 
-VPC_ID="vpc-xxxxxxxx"                    # ← YOUR default VPC ID
-VPC_SUBNET_IDS="subnet-xx,subnet-yy"   # ← Two public subnets in different AZs
+VPC_ID="vpc-0c6563d45766bc9eb"
+VPC_SUBNET_IDS="subnet-0b4b36da5bb4ac69c,subnet-03eb778d9f7b5ae2b"
 
 SNS_ALERT_EMAIL="paul.ananth@yahoo.com"
 SEC_USER_AGENT="SEC EDGAR Pipeline paul.ananth@yahoo.com"
