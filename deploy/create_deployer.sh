@@ -5,7 +5,7 @@
 # needed to run deploy/deploy_aws.sh.
 #
 # Run ONCE as an AWS root user or an IAM user with AdministratorAccess.
-# Prints access keys to stdout — save them, they are shown only once.
+# Prints access keys to stdout - save them, they are shown only once.
 #
 # Usage:
 #   bash deploy/create_deployer.sh
@@ -19,15 +19,15 @@
 
 set -euo pipefail
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# -- Config --------------------------------------------------------------------
 DEPLOYER_USER="sec-loader-deployer"
 POLICY_NAME="sec-edgar-deploy-policy"
 BUCKET="paulananth11-sec-edgar-bronze"
 AWS_REGION="us-east-1"
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 echo "============================================================"
-echo "  SEC EDGAR Pipeline — Create Deployer IAM User"
+echo "  SEC EDGAR Pipeline - Create Deployer IAM User"
 echo "  User   : $DEPLOYER_USER"
 echo "  Bucket : $BUCKET"
 echo "  Region : $AWS_REGION"
@@ -43,13 +43,13 @@ echo "  Caller: $(echo "$CALLER" | python3 -c "import sys,json; d=json.load(sys.
 echo ""
 echo "[2/3] Creating IAM user: $DEPLOYER_USER"
 if aws iam get-user --user-name "$DEPLOYER_USER" > /dev/null 2>&1; then
-    echo "  [already exists] — updating policy"
+    echo "  [already exists] - updating policy"
 else
     aws iam create-user --user-name "$DEPLOYER_USER" --output text > /dev/null
     echo "  [created]"
 fi
 
-# Inline policy — least-privilege for deploy_aws.sh
+# Inline policy - least-privilege for deploy_aws.sh
 POLICY_DOC=$(cat <<POLICY
 {
   "Version": "2012-10-17",
@@ -174,7 +174,7 @@ echo "[3/3] Creating customer-managed policy and attaching to user..."
 POLICY_ARN="arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):policy/${POLICY_NAME}"
 
 if aws iam get-policy --policy-arn "$POLICY_ARN" > /dev/null 2>&1; then
-    echo "  Policy already exists — creating new version"
+    echo "  Policy already exists - creating new version"
     aws iam create-policy-version \
         --policy-arn "$POLICY_ARN" \
         --policy-document "$POLICY_DOC" \
@@ -192,9 +192,9 @@ aws iam attach-user-policy \
     --policy-arn "$POLICY_ARN"
 echo "  [OK] Policy attached to $DEPLOYER_USER"
 
-# Create access key (always creates a new one — max 2 per user)
+# Create access key (always creates a new one - max 2 per user)
 echo ""
-echo "Creating access keys (shown ONCE — save them now):"
+echo "Creating access keys (shown ONCE - save them now):"
 echo "------------------------------------------------------------"
 aws iam create-access-key \
     --user-name "$DEPLOYER_USER" \
@@ -208,12 +208,12 @@ echo "  1. Configure AWS CLI:"
 echo "       aws configure --profile sec-edgar"
 echo "       Region: $AWS_REGION  |  Output: json"
 echo ""
-echo "  2. Edit deploy/deploy_aws.sh — set your VPC_ID and VPC_SUBNET_IDS"
+echo "  2. Edit deploy/deploy_aws.sh - set your VPC_ID and VPC_SUBNET_IDS"
 echo ""
 echo "  3. Deploy:"
 echo "       AWS_PROFILE=sec-edgar bash deploy/deploy_aws.sh"
 echo ""
-echo "  4. Weekly full refresh (all ~10k CIKs — run manually each Sunday):"
+echo "  4. Weekly full refresh (all ~10k CIKs - run manually each Sunday):"
 echo "       aws stepfunctions start-execution \\"
 echo "         --state-machine-arn <ARN from deploy output> \\"
 echo "         --input '{\"ingestDate\":\"YYYY-MM-DD\",\"fullRefresh\":true}'"

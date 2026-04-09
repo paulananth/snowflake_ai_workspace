@@ -1,5 +1,4 @@
 {
-  "_comment": "Step Functions role — run/monitor ECS tasks and pass the task/execution roles to ECS. iam:PassRole is scoped to exactly the two pipeline roles. Placeholders: ACCOUNT, REGION, CLUSTER, TASK_ROLE_ARN, EXEC_ROLE_ARN substituted by deploy_aws.sh.",
   "Version": "2012-10-17",
   "Statement": [
     {

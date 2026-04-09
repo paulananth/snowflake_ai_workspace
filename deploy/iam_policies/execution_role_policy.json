@@ -1,5 +1,4 @@
 {
-  "_comment": "ECS execution role — used by the ECS control plane to pull the image from ECR and ship logs to CloudWatch. Placeholders: ACCOUNT, REGION, ECR_REPO are substituted by deploy_aws.sh.",
   "Version": "2012-10-17",
   "Statement": [
     {

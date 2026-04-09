@@ -1,5 +1,4 @@
 {
-  "_comment": "ECS task role for the ingest scripts. Scoped to the pipeline's S3 prefix only. No DeleteObject — tasks only write and read. Placeholders: BUCKET, REGION are substituted by deploy_aws.sh.",
   "Version": "2012-10-17",
   "Statement": [
     {
