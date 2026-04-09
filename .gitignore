@@ -30,3 +30,10 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# uv lockfile (auto-generated; causes merge conflicts across machines)
+uv.lock
+
+# Misc
+output/
+.azure-cli/
