@@ -47,3 +47,25 @@ def edgar_get(url: str, timeout: int = 20) -> dict | None:
         return resp.json()
     except requests.exceptions.Timeout:
         raise RuntimeError(f"Timeout fetching {url}") from None
+
+
+def edgar_get_text(url: str, timeout: int = 30) -> str | None:
+    """
+    Fetch a plain-text endpoint from SEC EDGAR (e.g. daily-index .idx files).
+
+    Returns:
+        Response body as a string on success.
+        None on HTTP 404.
+
+    Raises:
+        requests.HTTPError for non-404 HTTP errors (after retries).
+        requests.ConnectionError / Timeout on network failures.
+    """
+    try:
+        resp = _SESSION.get(url, timeout=timeout)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.text
+    except requests.exceptions.Timeout:
+        raise RuntimeError(f"Timeout fetching {url}") from None

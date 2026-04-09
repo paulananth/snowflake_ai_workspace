@@ -1,0 +1,27 @@
+{
+  "_comment": "Reference config for the EventBridge Scheduler rule. Actual creation is handled by deploy/deploy_aws.sh using the aws scheduler CLI. This file documents the settings.",
+  "Name": "sec-edgar-daily-ingest",
+  "ScheduleExpression": "cron(0 6 * * ? *)",
+  "ScheduleExpressionTimezone": "UTC",
+  "FlexibleTimeWindow": {
+    "Mode": "OFF"
+  },
+  "Description": "Trigger SEC EDGAR Bronze ingest pipeline daily at 06:00 UTC",
+  "State": "ENABLED",
+  "Target": {
+    "Arn": "<STATE_MACHINE_ARN>",
+    "RoleArn": "<SCHEDULER_ROLE_ARN>",
+    "Input": "{\"ingestDate\": \"<aws.events.event.time | slice(0,10) >\", \"fullRefresh\": false}"
+  },
+  "_notes": [
+    "For weekly full refresh (run manually each Sunday):",
+    "  aws stepfunctions start-execution \\",
+    "    --state-machine-arn <ARN> \\",
+    "    --input '{\"ingestDate\":\"YYYY-MM-DD\",\"fullRefresh\":true}'",
+    "",
+    "EventBridge Scheduler passes the event time in ISO-8601 format.",
+    "The ingestDate is extracted as the first 10 characters (YYYY-MM-DD).",
+    "Note: EventBridge Scheduler fires at 06:00 UTC; SEC EDGAR daily index",
+    "for the previous business day is typically available by 05:00 UTC."
+  ]
+}

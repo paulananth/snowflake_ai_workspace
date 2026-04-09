@@ -1,0 +1,12 @@
+{
+  "_comment": "EventBridge Scheduler role — only allowed to start the single pipeline state machine. Placeholders: ACCOUNT, REGION, STATE_MACHINE substituted by deploy_aws.sh.",
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "StartStateMachine",
+      "Effect": "Allow",
+      "Action": "states:StartExecution",
+      "Resource": "arn:aws:states:REGION:ACCOUNT:stateMachine:STATE_MACHINE"
+    }
+  ]
+}
