@@ -10,7 +10,7 @@ RUN pip install --no-cache-dir uv
 COPY pyproject.toml .python-version ./
 
 # Install production dependencies only (excludes dev group: jupyter, ipykernel).
-# --extra aws pulls in s3fs for AWS deployments; adlfs/azure-identity are already
+# --group aws pulls in s3fs for AWS deployments; adlfs/azure-identity are already
 # in the default dependency set so both Azure and AWS are covered by one image.
 RUN uv sync --no-dev --group aws
 
@@ -21,13 +21,15 @@ ENV PATH=/app/.venv/bin:$PATH
 # when scripts are invoked as  python scripts/ingest/0N_....py
 ENV PYTHONPATH=/app
 
-# Copy source — config, scripts, and pipeline runner
+# Verify venv works and key deps are importable before shipping
+RUN python -c "import pyarrow, s3fs, requests; print('deps OK')"
+
+# Copy source - config, scripts, and pipeline runner
 COPY config/ config/
 COPY scripts/ scripts/
 COPY pipeline.py .
 
-# Default: run the full pipeline.
-# ADF Custom Activity overrides CMD per activity, e.g.:
-#   scripts/ingest/01_ingest_tickers_exchange.py --date 2026-04-08
-ENTRYPOINT ["python"]
+# -u: unbuffered stdout/stderr so CloudWatch captures all output even on fast crashes
+ENTRYPOINT ["python", "-u"]
 CMD ["pipeline.py"]
+
