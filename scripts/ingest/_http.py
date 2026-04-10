@@ -63,7 +63,9 @@ def edgar_get_text(url: str, timeout: int = 30) -> str | None:
     """
     try:
         resp = _SESSION.get(url, timeout=timeout)
-        if resp.status_code == 404:
+        if resp.status_code in (403, 404):
+            # 404: file not published yet (weekend/holiday)
+            # 403: SEC EDGAR rate-limit or IP block; treat as no data for this date
             return None
         resp.raise_for_status()
         return resp.text

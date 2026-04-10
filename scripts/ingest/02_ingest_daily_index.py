@@ -65,7 +65,7 @@ def _master_idx_url(d: date) -> str:
     """Daily master.idx URL: pipe-delimited, CIK|Company Name|Form Type|Date Filed|Filename"""
     return (
         f"https://www.sec.gov/Archives/edgar/daily-index"
-        f"/{d.year}/QTR{_quarter(d)}/master{d.strftime('%Y%m%d')}.idx"
+        f"/{d.year}/QTR{_quarter(d)}/master.{d.strftime('%Y%m%d')}.idx"
     )
 
 
