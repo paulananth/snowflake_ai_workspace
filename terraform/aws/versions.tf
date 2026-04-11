@@ -1,5 +1,5 @@
 terraform {
-  required_version = ">= 1.5"
+  required_version = ">= 1.7"  # 1.7+ required for mock_provider in terraform test
 
   required_providers {
     aws = {
